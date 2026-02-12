@@ -117,6 +117,10 @@ ai_pipeline:
       enabled: true
       cli_command: claude
       timeout_seconds: 300
+    kimi:
+      enabled: true
+      cli_command: kimi
+      timeout_seconds: 300
   consensus:
     min_models_for_consensus: 2
     agreement_threshold: 0.7

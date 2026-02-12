@@ -51,6 +51,13 @@ def check_prerequisites() -> dict:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         results["claude"] = {"installed": False, "version": None}
 
+    # Kimi CLI
+    try:
+        r = subprocess.run(["kimi", "--version"], capture_output=True, text=True, timeout=10)
+        results["kimi"] = {"installed": True, "version": r.stdout.strip()}
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        results["kimi"] = {"installed": False, "version": None}
+
     # Git
     try:
         r = subprocess.run(["git", "--version"], capture_output=True, text=True, timeout=10)

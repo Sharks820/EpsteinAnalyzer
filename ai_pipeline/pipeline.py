@@ -2,7 +2,7 @@
 EpsteinAnalyzer - AI Pipeline Module
 =====================================
 Multi-model AI orchestration engine that sends documents to Codex CLI,
-Gemini CLI, and Claude Code for analysis, then merges results via consensus.
+Gemini CLI, Claude Code, and Kimi CLI for analysis, then merges results via consensus.
 
 Usage:
     python -m ai_pipeline.pipeline --dataset 1
@@ -367,7 +367,20 @@ class ClaudeRunner(ModelRunner):
         return "claude"
 
     def _build_command(self, prompt_file: str) -> list[str]:
-        return ["claude", "--print"]
+        return ["claude", "--print", "--model", "claude-sonnet-4-5-20250929"]
+
+
+class KimiRunner(ModelRunner):
+    """Runs prompts through the Kimi CLI (kimi --quiet for non-interactive)."""
+
+    def __init__(self, timeout: int = 300):
+        super().__init__("kimi", timeout)
+
+    def get_name(self) -> str:
+        return "kimi"
+
+    def _build_command(self, prompt_file: str) -> list[str]:
+        return ["kimi", "--quiet", "--model", "k2.5"]
 
 
 # ===================================================================
@@ -945,7 +958,7 @@ class ConsensusEngine:
 class GracefulDegradation:
     """Manages model availability and degraded-mode operation."""
 
-    _RUNNER_CLASSES: list[type[ModelRunner]] = [CodexRunner, GeminiRunner, ClaudeRunner]
+    _RUNNER_CLASSES: list[type[ModelRunner]] = [CodexRunner, GeminiRunner, ClaudeRunner, KimiRunner]
 
     def __init__(self, config: Optional[dict] = None):
         self.config = config or _load_config()
@@ -979,7 +992,9 @@ class GracefulDegradation:
         return available
 
     def describe_mode(self, available_count: int) -> str:
-        if available_count >= 3:
+        if available_count >= 4:
+            return "quad_consensus"
+        if available_count == 3:
             return "full_consensus"
         if available_count == 2:
             return "dual_consensus"
