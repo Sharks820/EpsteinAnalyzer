@@ -4,6 +4,7 @@ Flask web UI for investigative document analysis.
 Runs locally at http://127.0.0.1:8080
 """
 
+import html
 import json
 import os
 import sys
@@ -1271,7 +1272,7 @@ GRAPH_HTML = r"""{% extends "base.html" %}
 
 {% block scripts %}
 <script>
-const graphData = {{ graph_json|safe }};
+const graphData = {{ graph_data|tojson }};
 const width = document.getElementById('graph').clientWidth || 1200;
 const height = document.getElementById('graph').clientHeight || 700;
 const svg = d3.select('#graph').attr('viewBox', [0, 0, width, height]);
@@ -1387,12 +1388,12 @@ def graph_view():
         if r["source_entity_id"] in entity_ids and r["target_entity_id"] in entity_ids
     ]
 
-    graph_json = json.dumps({"nodes": nodes, "links": links})
+    graph_data = {"nodes": nodes, "links": links}
 
     return render_template_string(
         GRAPH_HTML,
         active="graph",
-        graph_json=graph_json,
+        graph_data=graph_data,
         node_count=len(nodes),
         edge_count=len(links),
     )
@@ -2056,8 +2057,10 @@ def export_public():
         "<table><thead><tr><th>Name</th><th>Type</th><th>Score</th><th>Evidence Count</th></tr></thead><tbody>",
     ]
     for e in entities:
+        name = html.escape(e.get('canonical_name') or e['name'])
+        etype = html.escape(e['entity_type'])
         lines.append(
-            f"<tr><td>{e.get('canonical_name') or e['name']}</td><td>{e['entity_type']}</td>"
+            f"<tr><td>{name}</td><td>{etype}</td>"
             f"<td>{e['implication_score']:.1f}</td><td>{e['evidence_count']}</td></tr>"
         )
     lines.append("</tbody></table></body></html>")
