@@ -1,0 +1,225 @@
+# EpsteinAnalyzer Configuration
+# ================================
+
+project:
+  name: "EpsteinAnalyzer"
+  version: "1.0.0"
+  data_dir: "./data"
+  max_disk_gb: 500
+  auto_compact_threshold: 0.78  # Trigger at 78% of max_disk_gb
+
+# Dashboard
+dashboard:
+  host: "127.0.0.1"
+  port: 8080
+  debug: false
+  secret_key: "CHANGE_THIS_ON_FIRST_RUN"
+
+# Harvester Sources
+harvester:
+  enabled_sources:
+    - doj
+    - github_mirror
+    - archive_org
+    - zenodo
+    - reddit
+    - foia_muckrock
+    - court_listener
+    - torrent
+    - state_courts
+
+  doj:
+    base_url: "https://www.justice.gov/epstein"
+    datasets_url: "https://www.justice.gov/epstein/doj-disclosures"
+    total_datasets: 12
+
+  github_mirrors:
+    - "https://github.com/yung-megafone/Epstein-Files"
+
+  archive_org:
+    collection_url: "https://ia600705.us.archive.org/21/items/epsteindocs/"
+    wayback_prefix: "https://web.archive.org/web/*/justice.gov/epstein*"
+
+  zenodo:
+    record_url: "https://zenodo.org/records/18512562"
+
+  reddit:
+    subreddits:
+      - "Epstein"
+      - "EpsteinFiles"
+      - "conspiracy"
+    search_terms:
+      - "epstein files"
+      - "epstein documents"
+      - "DOJ epstein release"
+
+  foia:
+    muckrock_search: "jeffrey epstein"
+
+  court_listener:
+    api_base: "https://www.courtlistener.com/api/rest/v4/"
+    case_searches:
+      - "Giuffre v. Maxwell"
+      - "United States v. Epstein"
+      - "United States v. Maxwell"
+      - "Doe v. Epstein"
+
+  state_courts:
+    florida:
+      enabled: true
+      portal: "https://www.pbcclerk.org/clerkwebportal/"
+    new_york:
+      enabled: true
+    usvi:
+      enabled: true
+
+  # Removed file detection - HIGHEST PRIORITY
+  removed_detection:
+    enabled: true
+    priority: "CRITICAL"
+    check_interval_hours: 24
+    alert_on_removal: true
+    auto_search_mirrors: true
+
+# Processor
+processor:
+  ocr:
+    engine: "tesseract"
+    languages: ["eng"]
+    dpi: 300
+    preprocessing: true
+
+  redaction_forensics:
+    text_layer_extraction: true
+    pdf_layer_analysis: true
+    metadata_extraction: true
+    ocr_layer_mismatch: true
+    copy_paste_extraction: true
+    font_character_analysis: true
+    cross_document_matching: true
+    ai_inference: true  # Last resort only
+
+  image_forensics:
+    layer_analysis: true
+    exif_extraction: true
+    thumbnail_recovery: true
+    black_box_analysis: true
+    cross_reference_search: true
+    auto_quarantine_minors: true
+    require_user_approval: true  # ALWAYS
+
+  email_chain:
+    subject_normalization: true
+    participant_matching: true
+    quoted_text_detection: true
+    gap_detection: true
+    auto_restitch_on_new: true
+
+  priority_scoring:
+    high_value_names_weight: 30
+    redaction_weight: 20
+    email_attachment_weight: 15
+    financial_weight: 15
+    location_weight: 10
+    case_reference_weight: 10
+    removed_file_weight: 50
+    priority_threshold: 60
+
+# AI Pipeline
+ai_pipeline:
+  models:
+    codex:
+      enabled: true
+      cli_command: "codex"
+      timeout_seconds: 300
+    gemini:
+      enabled: true
+      cli_command: "gemini"
+      timeout_seconds: 300
+    claude:
+      enabled: true
+      cli_command: "claude"
+      timeout_seconds: 300
+
+  consensus:
+    min_models_for_consensus: 2
+    agreement_threshold: 0.7
+    backfill_when_model_returns: true
+
+  batch:
+    max_batch_size: 20
+    chain_aware: true
+    rate_limit_seconds: 5
+
+# Knowledge Graph
+knowledge_graph:
+  entity_types:
+    - person
+    - organization
+    - location
+    - aircraft
+    - financial
+    - legal_case
+    - contact_info
+    - event
+    - redacted_entity
+
+  auto_inference:
+    co_occurrence: true
+    transitive_connections: true
+    temporal_clustering: true
+    pattern_detection: true
+
+  redaction_resolution:
+    track_candidates: true
+    re_evaluate_on_new_data: true
+    min_confidence_for_suggestion: 0.3
+
+# Security
+security:
+  encryption:
+    algorithm: "AES-256-GCM"
+    key_derivation: "argon2id"
+
+  integrity:
+    check_on_startup: true
+    hash_algorithm: "sha256"
+
+  honeypots:
+    enabled: true
+    file_count: 5
+
+  session:
+    wipe_temp_on_exit: true
+    clear_clipboard: true
+
+  backup:
+    prompt_after_session: true
+    incremental: true
+    encrypt_backups: true
+
+# Evidence Scoring
+evidence:
+  scoring:
+    direct_admission: 40
+    financial_link: 35
+    flight_log: 30
+    eyewitness_testimony: 30
+    photo_video: 25
+    email_coordination: 20
+    victim_deposition: 20
+    redaction_concealment: 15
+    convicted_associate: 10
+    general_cooccurrence: 5
+
+# Export
+export:
+  reddit:
+    strip_victim_names: true
+    require_review: true
+    auto_archive_wayback: true
+
+  public_viewer:
+    min_score_for_inclusion: 50
+    exclude_ai_inferences: true
+    strip_raw_text: true

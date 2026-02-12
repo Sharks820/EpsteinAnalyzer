@@ -1,0 +1,57 @@
+# EpsteinAnalyzer - Requirements
+# Core
+flask==3.1.0
+flask-socketio==5.5.1
+gunicorn==23.0.0
+
+# PDF Processing
+PyMuPDF==1.25.3
+pytesseract==0.3.13
+pdf2image==1.17.0
+Pillow==11.1.0
+
+# OCR & Text
+pdfplumber==0.11.6
+pdfminer.six==20231228
+
+# Database
+peewee==3.17.9
+
+# Web Scraping / Harvesting
+requests==2.32.3
+beautifulsoup4==4.12.3
+selenium==4.27.1
+lxml==5.3.0
+feedparser==6.0.11
+
+# Torrent Support
+libtorrent-rasterbar==2.0.10
+
+# NLP & Entity Extraction
+spacy==3.8.4
+en-core-web-trf==3.8.0
+
+# Knowledge Graph & Visualization
+networkx==3.4.2
+pyvis==0.3.2
+
+# Image Analysis
+opencv-python==4.10.0.84
+exifread==3.0.0
+
+# Encryption & Security
+cryptography==44.0.0
+pynacl==1.5.0
+
+# Utilities
+python-dateutil==2.9.0
+tqdm==4.67.1
+click==8.1.8
+pyyaml==6.0.2
+watchdog==6.0.0
+hashlib-additional==1.0.1
+colorama==0.4.6
+
+# Export
+markdown==3.7.0
+jinja2==3.1.5
