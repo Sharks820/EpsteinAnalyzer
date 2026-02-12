@@ -75,17 +75,15 @@ class EncryptionManager:
         aesgcm = AESGCM(key)
         with open(file_path, "rb") as fin, open(output_path, "wb") as fout:
             fout.write(salt)
-            chunk_idx = 0
             while True:
                 chunk = fin.read(self.CHUNK_SIZE)
                 if not chunk:
                     break
-                nonce = chunk_idx.to_bytes(self.NONCE_SIZE, "big")
+                nonce = os.urandom(self.NONCE_SIZE)
                 ct = aesgcm.encrypt(nonce, chunk, None)
                 fout.write(len(ct).to_bytes(4, "big"))
                 fout.write(nonce)
                 fout.write(ct)
-                chunk_idx += 1
         return output_path
 
     def decrypt_file(self, file_path: str, password: str, output_path: str = None):
@@ -308,14 +306,19 @@ class BackupManager:
                     last_backup_file.read_text().strip()
                 )
 
-        # Resolve backup_dir to skip it during traversal (prevents recursive backup)
+        # Resolve dirs to skip during traversal
         backup_dir_resolved = backup_dir.resolve()
+        temp_dir_resolved = (self.data_dir / "temp").resolve()
 
         for file_path in self.data_dir.rglob("*"):
             if not file_path.is_file():
                 continue
-            if "temp" in str(file_path):
-                continue  # Skip temp files
+            # Skip files inside the temp directory (use resolved path, not substring)
+            try:
+                if file_path.resolve().is_relative_to(temp_dir_resolved):
+                    continue
+            except (OSError, ValueError):
+                pass
             # Skip files inside the backup destination
             try:
                 if file_path.resolve().is_relative_to(backup_dir_resolved):
@@ -325,7 +328,7 @@ class BackupManager:
 
             # Incremental: only back up files modified since last backup
             if incremental and last_backup_time:
-                mod_time = datetime.utcfromtimestamp(file_path.stat().st_mtime)
+                mod_time = datetime.fromtimestamp(file_path.stat().st_mtime, tz=timezone.utc)
                 if mod_time < last_backup_time:
                     continue
 

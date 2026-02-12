@@ -2005,7 +2005,7 @@ class EntityExtractor:
         # Addresses
         for m in ADDRESS_PATTERN.finditer(text):
             addr = m.group(0).strip()
-            canonical = re.sub(r"\s+", " ", addr).title()
+            canonical = re.sub(r"\s+", " ", addr).upper()
             if canonical not in seen_canonical:
                 entities.append({
                     "name": addr,
@@ -2093,8 +2093,8 @@ class EntityExtractor:
         )
         # Normalize whitespace
         name = re.sub(r"\s+", " ", name).strip()
-        # Title case for consistency
-        name = name.title()
+        # Uppercase for consistency with knowledge_graph.normalize_name()
+        name = name.upper()
         return name
 
     @staticmethod

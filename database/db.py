@@ -140,8 +140,8 @@ class DatabaseManager:
             for doc in low_priority:
                 conn.execute(
                     """INSERT INTO deletion_queue (document_id, reason, ai_assessment, user_decision)
-                       VALUES (?, 'Auto-compact: low priority score', 'Flagged during auto-compact at 78% disk usage', 'pending')""",
-                    (doc["id"],),
+                       VALUES (?, 'Auto-compact: low priority score', ?, 'pending')""",
+                    (doc["id"], f"Flagged during auto-compact at {round(self.compact_threshold * 100)}% disk usage"),
                 )
             conn.commit()
             actions.append(f"Flagged {len(low_priority)} low-priority docs for your review")
