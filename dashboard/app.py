@@ -1250,8 +1250,8 @@ def entity_card(entity_id):
 
     # Redaction exposure -- how many redactions list this entity as a candidate
     redaction_exposure = query_scalar(
-        "SELECT COUNT(*) FROM redactions WHERE ai_candidates LIKE ?",
-        (f"%{entity.get('name', '')}%",),
+        r"SELECT COUNT(*) FROM redactions WHERE ai_candidates LIKE ? ESCAPE '\'",
+        (f"%{escape_like(entity.get('name', ''))}%",),
     )
 
     return render_template_string(
