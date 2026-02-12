@@ -303,6 +303,10 @@ class ModelRunner(ABC):
         finally:
             if tmp is not None:
                 try:
+                    # Overwrite with random data before deleting (prompt may contain sensitive text)
+                    tmp_size = os.path.getsize(tmp.name)
+                    with open(tmp.name, "wb") as wf:
+                        wf.write(os.urandom(tmp_size))
                     os.unlink(tmp.name)
                 except OSError:
                     pass

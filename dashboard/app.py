@@ -8,6 +8,7 @@ import html
 import json
 import logging
 import os
+import re
 import sys
 import sqlite3
 import threading
@@ -108,8 +109,9 @@ def escape_like(s: str) -> str:
 
 
 def sanitize_fts(q: str) -> str:
-    """Wrap user input in double quotes to disable FTS5 operators."""
-    return '"' + q.replace('"', '""') + '"'
+    """Strip non-word characters and wrap in double quotes to disable FTS5 operators."""
+    cleaned = re.sub(r'[^\w\s]', '', q)
+    return '"' + cleaned.replace('"', '""') + '"'
 
 
 def safe_json(val, default=None):
@@ -859,8 +861,9 @@ def document_viewer(doc_id):
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         for j, para in enumerate(paragraphs[:5]):  # Limit to 5 per page for performance
             # Apply entity highlighting (escape para first to prevent XSS)
+            # Sort entities longest-first so shorter names don't break longer ones
             highlighted = html.escape(para)
-            for el in entity_links:
+            for el in sorted(entity_links, key=lambda e: len(e.get("entity_name", "")), reverse=True):
                 name = el.get("entity_name", "")
                 if not name:
                     continue
@@ -2404,8 +2407,10 @@ def main():
     host = config.get("dashboard", {}).get("host", "127.0.0.1")
     port = config.get("dashboard", {}).get("port", 8080)
     debug = config.get("dashboard", {}).get("debug", False)
-    secret = config.get("dashboard", {}).get("secret_key", "local-dev-key")
-    app.config["SECRET_KEY"] = secret
+    secret = config.get("dashboard", {}).get("secret_key", "")
+    if secret and secret not in ("CHANGE_THIS_ON_FIRST_RUN", "local-dev-key"):
+        app.config["SECRET_KEY"] = secret
+    # else: keep the random key generated at import time
 
     print(f"\n{'='*60}")
     print(f"  EpsteinAnalyzer Dashboard")

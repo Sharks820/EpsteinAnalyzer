@@ -139,7 +139,8 @@ def _request_with_retries(
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
                     wait = max(wait, int(retry_after))
-                jittered = wait * (0.5 + random.random())
+                # Additive jitter for 429: always >= server's Retry-After
+                jittered = wait + random.random() * wait * 0.5
                 logger.warning("429 Too Many Requests for %s -- waiting %.1fs", url, jittered)
                 time.sleep(jittered)
                 continue

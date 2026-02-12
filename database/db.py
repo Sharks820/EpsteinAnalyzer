@@ -178,23 +178,40 @@ class DatabaseManager:
     def get_stats(self) -> dict:
         conn = self.get_connection()
         try:
-            stats = {}
-            stats["total_documents"] = conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
-            stats["processed_documents"] = conn.execute("SELECT COUNT(*) FROM documents WHERE analysis_completed = 1").fetchone()[0]
-            stats["total_entities"] = conn.execute("SELECT COUNT(*) FROM entities").fetchone()[0]
-            stats["total_relationships"] = conn.execute("SELECT COUNT(*) FROM relationships").fetchone()[0]
-            stats["total_redactions"] = conn.execute("SELECT COUNT(*) FROM redactions").fetchone()[0]
-            stats["recovered_redactions"] = conn.execute("SELECT COUNT(*) FROM redactions WHERE is_recovered = 1").fetchone()[0]
-            stats["total_email_chains"] = conn.execute("SELECT COUNT(*) FROM email_chains").fetchone()[0]
-            stats["total_findings"] = conn.execute("SELECT COUNT(*) FROM findings").fetchone()[0]
-            stats["removed_files_detected"] = conn.execute("SELECT COUNT(*) FROM removed_files").fetchone()[0]
-            stats["removed_files_recovered"] = conn.execute("SELECT COUNT(*) FROM removed_files WHERE recovered = 1").fetchone()[0]
-            stats["pending_image_reviews"] = conn.execute("SELECT COUNT(*) FROM images WHERE user_reviewed = 0 AND recovery_successful = 1").fetchone()[0]
-            stats["pending_deletions"] = conn.execute("SELECT COUNT(*) FROM deletion_queue WHERE user_decision = 'pending'").fetchone()[0]
-            disk = self.check_disk_usage()
+            # Single query to fetch all counts (avoids 11 separate COUNT round-trips)
+            row = conn.execute("""
+                SELECT
+                    (SELECT COUNT(*) FROM documents) AS total_documents,
+                    (SELECT COUNT(*) FROM documents WHERE analysis_completed = 1) AS processed_documents,
+                    (SELECT COUNT(*) FROM entities) AS total_entities,
+                    (SELECT COUNT(*) FROM relationships) AS total_relationships,
+                    (SELECT COUNT(*) FROM redactions) AS total_redactions,
+                    (SELECT COUNT(*) FROM redactions WHERE is_recovered = 1) AS recovered_redactions,
+                    (SELECT COUNT(*) FROM email_chains) AS total_email_chains,
+                    (SELECT COUNT(*) FROM findings) AS total_findings,
+                    (SELECT COUNT(*) FROM removed_files) AS removed_files_detected,
+                    (SELECT COUNT(*) FROM removed_files WHERE recovered = 1) AS removed_files_recovered,
+                    (SELECT COUNT(*) FROM images WHERE user_reviewed = 0 AND recovery_successful = 1) AS pending_image_reviews,
+                    (SELECT COUNT(*) FROM deletion_queue WHERE user_decision = 'pending') AS pending_deletions
+            """).fetchone()
+            stats = {k: row[k] for k in row.keys()}
+            disk = self._get_cached_disk_usage()
             stats["disk_usage_gb"] = disk["total_gb"]
             stats["disk_usage_percent"] = disk["usage_percent"]
             stats["needs_compact"] = disk["needs_compact"]
             return stats
         finally:
             conn.close()
+
+    def _get_cached_disk_usage(self) -> dict:
+        """Return cached disk usage; only re-scan filesystem every 60 seconds."""
+        import time as _time
+        now = _time.monotonic()
+        if (
+            not hasattr(self, "_disk_cache")
+            or self._disk_cache is None
+            or now - self._disk_cache_time > 60
+        ):
+            self._disk_cache = self.check_disk_usage()
+            self._disk_cache_time = now
+        return self._disk_cache

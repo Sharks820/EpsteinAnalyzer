@@ -233,8 +233,8 @@ END;
 
 CREATE TABLE IF NOT EXISTS relationships (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    source_entity_id INTEGER NOT NULL REFERENCES entities(id),
-    target_entity_id INTEGER NOT NULL REFERENCES entities(id),
+    source_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    target_entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
     relationship_type TEXT NOT NULL,  -- 'flew_with', 'emailed', 'employed_by', etc.
     weight REAL DEFAULT 1.0,  -- Frequency/strength
     confidence REAL DEFAULT 1.0,
@@ -497,3 +497,4 @@ CREATE TABLE IF NOT EXISTS removed_files (
 
 CREATE INDEX idx_removed_recovered ON removed_files(recovered);
 CREATE INDEX idx_removed_priority ON removed_files(priority);
+CREATE INDEX idx_removed_url ON removed_files(original_url);

@@ -89,6 +89,8 @@ class GraphEngine:
         self.kg_config = self.config.get("knowledge_graph", {})
         self.evidence_config = self.config.get("evidence", {}).get("scoring", {})
         self._nx: Optional[nx.Graph] = None  # lazy-loaded
+        self._nx_built_at: float = 0.0  # monotonic time of last build
+        self._nx_ttl: float = 300.0  # 5 minute TTL
 
     # ------------------------------------------------------------------
     # NetworkX in-memory mirror
@@ -127,8 +129,10 @@ class GraphEngine:
 
     @property
     def nx_graph(self) -> nx.Graph:
-        if self._nx is None:
+        import time as _time
+        if self._nx is None or (_time.monotonic() - self._nx_built_at > self._nx_ttl):
             self._build_nx_graph()
+            self._nx_built_at = _time.monotonic()
         return self._nx
 
     def invalidate_cache(self):
@@ -575,10 +579,10 @@ class EntityResolver:
             if row:
                 return row["id"]
 
-            # Filter aliases at DB level, then verify with normalization
+            # Filter aliases at DB level using canonical form, then verify with normalization
             rows = conn.execute(
-                "SELECT id, aliases FROM entities WHERE aliases LIKE ? ESCAPE '\\'",
-                (f"%{_escape_like(name)}%",),
+                "SELECT id, aliases FROM entities WHERE aliases LIKE ? ESCAPE '\\' OR aliases LIKE ? ESCAPE '\\'",
+                (f"%{_escape_like(name)}%", f"%{_escape_like(canonical)}%"),
             ).fetchall()
             for r in rows:
                 aliases = _json_loads_safe(r["aliases"])

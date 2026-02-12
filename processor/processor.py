@@ -2494,9 +2494,14 @@ class ProcessorEngine:
     def _ensure_document(self, file_path: str, dataset_id: Optional[int]) -> int:
         """Ensure document record exists, create if not. Returns document_id."""
         file_path = str(Path(file_path).resolve())
-        file_bytes = Path(file_path).read_bytes()
-        file_hash = hashlib.sha256(file_bytes).hexdigest()
-        file_size = len(file_bytes)
+        # Stream hash computation to avoid loading entire file into memory
+        sha256 = hashlib.sha256()
+        file_size = 0
+        with open(file_path, "rb") as fh:
+            while chunk := fh.read(65536):
+                sha256.update(chunk)
+                file_size += len(chunk)
+        file_hash = sha256.hexdigest()
         filename = Path(file_path).name
 
         conn = self.db.get_connection()
