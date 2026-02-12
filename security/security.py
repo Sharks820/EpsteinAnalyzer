@@ -5,6 +5,7 @@ AES-256-GCM encryption at rest with Scrypt key derivation.
 """
 import os
 import sys
+import hmac
 import json
 import hashlib
 import shutil
@@ -109,6 +110,9 @@ class EncryptionManager:
                     if len(ct_len_bytes) < 4:
                         raise ValueError("Corrupted encrypted file: truncated chunk header")
                     ct_len = int.from_bytes(ct_len_bytes, "big")
+                    max_ct = self.CHUNK_SIZE + 1024  # chunk + GCM tag overhead
+                    if ct_len > max_ct:
+                        raise ValueError(f"Corrupted encrypted file: chunk size {ct_len} exceeds maximum {max_ct}")
                     nonce = fin.read(self.NONCE_SIZE)
                     if len(nonce) < self.NONCE_SIZE:
                         raise ValueError("Corrupted encrypted file: truncated nonce")
@@ -532,6 +536,10 @@ class USBProtection:
         self.backup_path = Path(backup_path)
         self.attempts_file = self.backup_path / ".attempts"
 
+    def _hmac_key(self) -> bytes:
+        """Derive a stable HMAC key from the backup path."""
+        return hashlib.sha256(str(self.backup_path).encode()).digest()
+
     def record_attempt(self, success: bool):
         attempts = self._get_attempts()
         if success:
@@ -539,7 +547,7 @@ class USBProtection:
             return True
 
         attempts += 1
-        self.attempts_file.write_text(str(attempts))
+        self._write_attempts(attempts)
 
         if attempts >= self.MAX_ATTEMPTS:
             logger.critical(
@@ -550,11 +558,27 @@ class USBProtection:
             return False
         return True
 
+    def _write_attempts(self, count: int):
+        """Write HMAC-signed attempt counter."""
+        data = str(count).encode()
+        sig = hmac.new(self._hmac_key(), data, hashlib.sha256).hexdigest()
+        self.attempts_file.write_text(f"{count}:{sig}")
+
     def _get_attempts(self) -> int:
         if self.attempts_file.exists():
             try:
-                return int(self.attempts_file.read_text().strip())
-            except ValueError:
+                raw = self.attempts_file.read_text().strip()
+                if ":" in raw:
+                    count_str, sig = raw.rsplit(":", 1)
+                    expected = hmac.new(self._hmac_key(), count_str.encode(), hashlib.sha256).hexdigest()
+                    if hmac.compare_digest(sig, expected):
+                        return int(count_str)
+                    # Tampered — treat as max attempts to trigger wipe
+                    logger.critical("USB attempt counter tampered at %s", self.backup_path)
+                    return self.MAX_ATTEMPTS
+                # Legacy unsigned format — treat as 0 (fresh start)
+                return 0
+            except (ValueError, OSError):
                 return 0
         return 0
 

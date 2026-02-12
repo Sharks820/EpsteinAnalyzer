@@ -1099,14 +1099,15 @@ class PipelineEngine:
         model_names: list[str] = []
 
         for runner in runners:
+            t0 = time.time()
             response = runner.run(prompt)
+            elapsed = time.time() - t0
             raw_responses[runner.get_name()] = response
 
             if response:
                 parsed = self.parser.parse_response(response, runner.get_name())
                 # Save individual analysis to DB
-                processing_time = 0.0  # already logged by runner
-                self._save_analysis(document_id, runner.get_name(), parsed, response, processing_time)
+                self._save_analysis(document_id, runner.get_name(), parsed, response, elapsed)
                 parsed_analyses.append(parsed)
                 model_names.append(runner.get_name())
             else:

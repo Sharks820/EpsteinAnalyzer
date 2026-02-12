@@ -15,6 +15,7 @@ import hashlib
 import json
 import logging
 import os
+import random
 import re
 import shutil
 import sqlite3
@@ -138,23 +139,26 @@ def _request_with_retries(
                 retry_after = resp.headers.get("Retry-After")
                 if retry_after and retry_after.isdigit():
                     wait = max(wait, int(retry_after))
-                logger.warning("429 Too Many Requests for %s -- waiting %ds", url, wait)
-                time.sleep(wait)
+                jittered = wait * (0.5 + random.random())
+                logger.warning("429 Too Many Requests for %s -- waiting %.1fs", url, jittered)
+                time.sleep(jittered)
                 continue
             if resp.status_code in (502, 503, 504):
                 wait = min(BACKOFF_BASE ** attempt, BACKOFF_MAX)
-                logger.warning("%d from %s -- retry %d/%d in %ds",
-                               resp.status_code, url, attempt, max_retries, wait)
-                time.sleep(wait)
+                jittered = wait * (0.5 + random.random())
+                logger.warning("%d from %s -- retry %d/%d in %.1fs",
+                               resp.status_code, url, attempt, max_retries, jittered)
+                time.sleep(jittered)
                 continue
             resp.raise_for_status()
             return resp
         except (requests.ConnectionError, requests.Timeout) as exc:
             last_exc = exc
             wait = min(BACKOFF_BASE ** attempt, BACKOFF_MAX)
-            logger.warning("Network error for %s: %s -- retry %d/%d in %ds",
-                           url, exc, attempt, max_retries, wait)
-            time.sleep(wait)
+            jittered = wait * (0.5 + random.random())
+            logger.warning("Network error for %s: %s -- retry %d/%d in %.1fs",
+                           url, exc, attempt, max_retries, jittered)
+            time.sleep(jittered)
     raise requests.ConnectionError(
         f"Failed after {max_retries} retries for {url}"
     ) from last_exc
@@ -301,10 +305,9 @@ class SourceModule(ABC):
                     local_path.stat().st_size,
                 ),
             )
-            conn.commit()
             doc_id = cur.lastrowid
 
-            # File integrity record
+            # File integrity record (single atomic commit for both inserts)
             conn.execute(
                 """INSERT OR REPLACE INTO file_integrity
                    (file_path, sha256_hash, size_bytes, last_verified_at)

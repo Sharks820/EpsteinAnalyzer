@@ -284,6 +284,7 @@ class RedditExporter:
         self.require_review: bool = self.export_config.get("require_review", True)
         self._template = self._resolve_template(template_name)
         self._custom_redactions: List[str] = []
+        self._victim_cache: Optional[List[dict]] = None
 
     # ------------------------------------------------------------------
     # Template management
@@ -306,27 +307,32 @@ class RedditExporter:
         """Register a regex or literal string to be redacted from all output."""
         self._custom_redactions.append(pattern)
 
+    def _get_victims(self) -> list:
+        """Fetch and cache victim entity rows."""
+        if self._victim_cache is None:
+            conn = self.db.get_connection()
+            try:
+                self._victim_cache = conn.execute(
+                    "SELECT name, canonical_name, aliases FROM entities "
+                    "WHERE is_victim = 1 OR is_minor = 1"
+                ).fetchall()
+            finally:
+                conn.close()
+        return self._victim_cache
+
     def _apply_redactions(self, text: str) -> str:
         """Strip victim names and custom redactions from the text."""
         if not text:
             return text
 
-        # Strip victim names from the database
+        # Strip victim names (cached)
         if self.strip_victim_names:
-            conn = self.db.get_connection()
-            try:
-                victims = conn.execute(
-                    "SELECT name, canonical_name, aliases FROM entities "
-                    "WHERE is_victim = 1 OR is_minor = 1"
-                ).fetchall()
-                for v in victims:
-                    text = text.replace(v["name"], "[REDACTED-VICTIM]")
-                    if v["canonical_name"]:
-                        text = text.replace(v["canonical_name"], "[REDACTED-VICTIM]")
-                    for alias in _json_loads_safe(v["aliases"]):
-                        text = text.replace(alias, "[REDACTED-VICTIM]")
-            finally:
-                conn.close()
+            for v in self._get_victims():
+                text = text.replace(v["name"], "[REDACTED-VICTIM]")
+                if v["canonical_name"]:
+                    text = text.replace(v["canonical_name"], "[REDACTED-VICTIM]")
+                for alias in _json_loads_safe(v["aliases"]):
+                    text = text.replace(alias, "[REDACTED-VICTIM]")
 
         # Custom redactions
         for pattern in self._custom_redactions:
@@ -873,6 +879,7 @@ class PublicViewerExporter:
             _PROJECT_ROOT / "public_viewer" / "data"
         )
         self._victim_ids: Optional[Set[int]] = None
+        self._victim_names_cache: Optional[List[str]] = None
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -892,6 +899,19 @@ class PublicViewerExporter:
         finally:
             conn.close()
 
+    def _get_victim_names(self) -> List[str]:
+        """Fetch and cache victim names."""
+        if self._victim_names_cache is None:
+            conn = self.db.get_connection()
+            try:
+                rows = conn.execute(
+                    "SELECT name FROM entities WHERE is_victim = 1 OR is_minor = 1"
+                ).fetchall()
+                self._victim_names_cache = [r["name"] for r in rows]
+            finally:
+                conn.close()
+        return self._victim_names_cache
+
     def _redact_context(self, text: Optional[str]) -> str:
         """Remove raw OCR text, victim names, and sensitive content."""
         if not text:
@@ -899,16 +919,9 @@ class PublicViewerExporter:
         if self.strip_raw_text and len(text) > 500:
             text = text[:497] + "..."
 
-        # Strip victim names
-        conn = self.db.get_connection()
-        try:
-            victims = conn.execute(
-                "SELECT name FROM entities WHERE is_victim = 1 OR is_minor = 1"
-            ).fetchall()
-            for v in victims:
-                text = text.replace(v["name"], "[REDACTED]")
-        finally:
-            conn.close()
+        # Strip victim names (cached)
+        for name in self._get_victim_names():
+            text = text.replace(name, "[REDACTED]")
 
         return text
 
@@ -1147,21 +1160,17 @@ class PublicViewerExporter:
                    ORDER BY implication_score DESC""",
                 (self.min_score,),
             ).fetchall()
-        finally:
-            conn.close()
 
-        cards: Dict[int, Dict[str, Any]] = {}
-        for ent in entities:
-            eid = ent["id"]
-            if eid in victim_ids:
-                continue
+            cards: Dict[int, Dict[str, Any]] = {}
+            for ent in entities:
+                eid = ent["id"]
+                if eid in victim_ids:
+                    continue
 
-            score = ent["implication_score"] or 0
-            aliases = _json_loads_safe(ent["aliases"])
+                score = ent["implication_score"] or 0
+                aliases = _json_loads_safe(ent["aliases"])
 
-            # Top evidence
-            conn = self.db.get_connection()
-            try:
+                # Top evidence (reuse single connection)
                 ev_rows = conn.execute(
                     """SELECT edl.damning_score, edl.context_snippet,
                               d.doc_type, d.source, d.id AS document_id
@@ -1236,29 +1245,28 @@ class PublicViewerExporter:
                             ),
                         })
 
-            finally:
-                conn.close()
+                cards[eid] = {
+                    "entity": {
+                        "id": eid,
+                        "name": ent["name"],
+                        "type": ent["entity_type"],
+                        "score": score,
+                        "score_label": _score_to_label(score),
+                        "score_color": _score_to_color(score),
+                        "role": ent["role"],
+                        "aliases": aliases[:5] if aliases else [],
+                        "evidence_count": ent["evidence_count"] or 0,
+                        "document_count": ent["document_count"] or 0,
+                        "connection_count": len(connections),
+                    },
+                    "top_evidence": top_evidence,
+                    "connections": connections,
+                    "timeline": timeline,
+                }
 
-            cards[eid] = {
-                "entity": {
-                    "id": eid,
-                    "name": ent["name"],
-                    "type": ent["entity_type"],
-                    "score": score,
-                    "score_label": _score_to_label(score),
-                    "score_color": _score_to_color(score),
-                    "role": ent["role"],
-                    "aliases": aliases[:5] if aliases else [],
-                    "evidence_count": ent["evidence_count"] or 0,
-                    "document_count": ent["document_count"] or 0,
-                    "connection_count": len(connections),
-                },
-                "top_evidence": top_evidence,
-                "connections": connections,
-                "timeline": timeline,
-            }
-
-        return cards
+            return cards
+        finally:
+            conn.close()
 
     def generate_static_site(self, output_dir: Optional[str] = None) -> Path:
         """Write all JSON data files to *output_dir* for the static site.

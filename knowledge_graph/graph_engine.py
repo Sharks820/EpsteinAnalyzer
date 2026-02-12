@@ -575,9 +575,10 @@ class EntityResolver:
             if row:
                 return row["id"]
 
-            # Scan aliases (JSON arrays stored as text)
+            # Filter aliases at DB level, then verify with normalization
             rows = conn.execute(
-                "SELECT id, aliases FROM entities WHERE aliases IS NOT NULL"
+                "SELECT id, aliases FROM entities WHERE aliases LIKE ? ESCAPE '\\'",
+                (f"%{_escape_like(name)}%",),
             ).fetchall()
             for r in rows:
                 aliases = _json_loads_safe(r["aliases"])
@@ -1382,13 +1383,17 @@ class RedactionResolver:
             ).fetchone()
             name = confirmed_name["name"] if confirmed_name else ""
             # Find redactions that had this entity as a candidate
+            # Use json_each to match exact entity_id in JSON array, avoiding substring collisions
             conn.execute(
                 """UPDATE redactions
                    SET status = 'confirmed_by_user',
                        user_confirmed_value = ?,
                        updated_at = ?
-                   WHERE ai_candidates LIKE ? ESCAPE '\\' """,
-                (name, _now_iso(), f"%{_escape_like(confirmed_entity_id)}%"),
+                   WHERE id IN (
+                       SELECT r.id FROM redactions r, json_each(r.ai_candidates) j
+                       WHERE json_extract(j.value, '$.entity_id') = ?
+                   )""",
+                (name, _now_iso(), confirmed_entity_id),
             )
             conn.commit()
         finally:

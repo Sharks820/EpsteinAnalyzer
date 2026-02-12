@@ -6,9 +6,11 @@ Runs locally at http://127.0.0.1:8080
 
 import html
 import json
+import logging
 import os
 import sys
 import sqlite3
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -44,13 +46,17 @@ socketio = SocketIO(app, async_mode="threading")
 
 # Lazy-initialized database manager (avoids import-time side effects)
 _db: "DatabaseManager | None" = None
+_db_lock = threading.Lock()
+logger = logging.getLogger(__name__)
 
 
 def _get_db() -> "DatabaseManager":
     global _db
     if _db is None:
-        _db = DatabaseManager(str(PROJECT_ROOT / "config" / "settings.yaml"))
-        _db.initialize()
+        with _db_lock:
+            if _db is None:
+                _db = DatabaseManager(str(PROJECT_ROOT / "config" / "settings.yaml"))
+                _db.initialize()
     return _db
 
 # ---------------------------------------------------------------------------
@@ -382,7 +388,8 @@ function apiGet(url){
 def inject_sidebar_data():
     try:
         stats = _get_db().get_stats()
-    except Exception:
+    except Exception as e:
+        logger.warning("sidebar stats failed: %s", e)
         stats = {}
     return {
         "pending_images": stats.get("pending_image_reviews", 0),
@@ -851,11 +858,14 @@ def document_viewer(doc_id):
         text = page.get("text_content", "") or ""
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         for j, para in enumerate(paragraphs[:5]):  # Limit to 5 per page for performance
-            # Apply entity highlighting
-            highlighted = para
+            # Apply entity highlighting (escape para first to prevent XSS)
+            highlighted = html.escape(para)
             for el in entity_links:
                 name = el.get("entity_name", "")
-                if name and name in highlighted:
+                if not name:
+                    continue
+                safe_name = html.escape(name)
+                if safe_name in highlighted:
                     etype = el.get("entity_type", "person")
                     css_map = {
                         "person": "hl-person",
@@ -865,8 +875,8 @@ def document_viewer(doc_id):
                         "legal_case": "hl-legal",
                     }
                     css = css_map.get(etype, "hl-person")
-                    link = f'<a href="/entity/{el["entity_id"]}" class="{css}">{name}</a>'
-                    highlighted = highlighted.replace(name, link, 1)
+                    link = f'<a href="/entity/{int(el["entity_id"])}" class="{css}">{safe_name}</a>'
+                    highlighted = highlighted.replace(safe_name, link, 1)
             annotations.append({
                 "page": page["page_number"],
                 "para": j + 1,
@@ -890,7 +900,11 @@ def serve_file(doc_id):
     doc = query_one("SELECT file_path FROM documents WHERE id = ?", (doc_id,))
     if not doc or not doc.get("file_path"):
         abort(404)
-    fp = Path(doc["file_path"])
+    fp = Path(doc["file_path"]).resolve()
+    # Prevent path traversal: file must be inside the project data directory
+    data_dir = (PROJECT_ROOT / "data").resolve()
+    if not fp.is_relative_to(data_dir):
+        abort(403)
     if not fp.exists():
         abort(404)
     return send_from_directory(str(fp.parent), fp.name)
