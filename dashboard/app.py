@@ -110,7 +110,9 @@ def escape_like(s: str) -> str:
 
 def sanitize_fts(q: str) -> str:
     """Strip non-word characters and wrap in double quotes to disable FTS5 operators."""
-    cleaned = re.sub(r'[^\w\s]', '', q)
+    cleaned = re.sub(r'[^\w\s]', '', q).strip()
+    if not cleaned:
+        return None  # Caller must handle: skip FTS query
     return '"' + cleaned.replace('"', '""') + '"'
 
 
@@ -333,6 +335,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
       <a href="/deletions" class="{% if active == 'deletions' %}active{% endif %}">&#9746; Deletion Queue
         {% if pending_deletions %}<span class="badge">{{ pending_deletions }}</span>{% endif %}</a>
       <a href="/export" class="{% if active == 'export' %}active{% endif %}">&#9112; Export Tools</a>
+      <a href="/audit" class="{% if active == 'audit' %}active{% endif %}">&#9783; Audit Log</a>
       <a href="/settings" class="{% if active == 'settings' %}active{% endif %}">&#9881; Settings</a>
     </nav>
     <div class="sidebar-footer">
@@ -671,8 +674,8 @@ DOCUMENT_VIEWER_HTML = r"""{% extends "base.html" %}
             onclick="apiPost('/api/document/{{ doc.id }}/flag').then(()=>location.reload())">
       {% if doc.user_flagged %}Flagged{% else %}Flag{% endif %}
     </button>
-    <a href="/document/{{ doc.id - 1 }}" class="btn btn-sm">&larr; Prev</a>
-    <a href="/document/{{ doc.id + 1 }}" class="btn btn-sm">Next &rarr;</a>
+    {% if prev_doc_id %}<a href="/document/{{ prev_doc_id }}" class="btn btn-sm">&larr; Prev</a>{% endif %}
+    {% if next_doc_id %}<a href="/document/{{ next_doc_id }}" class="btn btn-sm">Next &rarr;</a>{% endif %}
   </div>
 </div>
 
@@ -886,6 +889,10 @@ def document_viewer(doc_id):
                 "html": highlighted,
             })
 
+    # Query actual prev/next document IDs (handles non-contiguous IDs)
+    prev_row = query_one("SELECT id FROM documents WHERE id < ? ORDER BY id DESC LIMIT 1", (doc_id,))
+    next_row = query_one("SELECT id FROM documents WHERE id > ? ORDER BY id ASC LIMIT 1", (doc_id,))
+
     return render_template_string(
         DOCUMENT_VIEWER_HTML,
         active="document",
@@ -895,6 +902,8 @@ def document_viewer(doc_id):
         entity_links=entity_links,
         redactions=redactions,
         annotations=annotations[:50],  # Cap total annotations
+        prev_doc_id=prev_row["id"] if prev_row else None,
+        next_doc_id=next_row["id"] if next_row else None,
     )
 
 
@@ -1278,6 +1287,12 @@ GRAPH_HTML = r"""{% extends "base.html" %}
       <option value="person">People</option>
       <option value="organization">Organizations</option>
       <option value="location">Locations</option>
+      <option value="aircraft">Aircraft</option>
+      <option value="financial">Financial</option>
+      <option value="legal_case">Legal Cases</option>
+      <option value="contact_info">Contact Info</option>
+      <option value="event">Events</option>
+      <option value="redacted_entity">Redacted</option>
     </select>
     <button class="btn btn-sm" onclick="resetZoom()">Reset View</button>
   </div>
@@ -1521,6 +1536,17 @@ CHAIN_DETAIL_HTML = r"""{% extends "base.html" %}
 
 <div class="timeline">
   {% for msg in messages %}
+  {% if (msg.position_in_chain or loop.index) in gap_before_positions %}
+  <div class="timeline-item" style="padding:8px 16px">
+    <div style="border:2px dashed var(--orange);border-radius:8px;padding:12px 16px;background:rgba(210,153,34,.08);display:flex;align-items:center;gap:10px">
+      <span style="font-size:1.2rem">&#9888;</span>
+      <div>
+        <strong class="text-orange" style="font-size:.85rem">Missing Email(s) Detected</strong>
+        <div class="text-muted" style="font-size:.78rem">Gap in chain — one or more emails appear to be missing before position #{{ msg.position_in_chain or loop.index }}</div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
   <div class="timeline-item">
     <div class="timeline-date">{{ msg.email_date or 'Unknown date' }} &middot; #{{ msg.position_in_chain or loop.index }}</div>
     <div class="card">
@@ -1566,8 +1592,16 @@ def chain_detail(chain_id):
 
     gap_details = safe_json(chain.get("gap_details"), [])
 
+    # Build set of positions that have a gap just before them
+    gap_before_positions = set()
+    for gap in gap_details:
+        before_pos = gap.get("before")
+        if before_pos is not None:
+            gap_before_positions.add(before_pos)
+
     return render_template_string(
-        CHAIN_DETAIL_HTML, active="chains", chain=chain, messages=messages, gap_details=gap_details
+        CHAIN_DETAIL_HTML, active="chains", chain=chain, messages=messages,
+        gap_details=gap_details, gap_before_positions=gap_before_positions,
     )
 
 
@@ -1981,8 +2015,11 @@ EXPORT_HTML = r"""{% extends "base.html" %}
 {% if export_result %}
 <div class="card mt-3">
   <h3 class="mb-2">Export Result</h3>
-  <pre style="white-space:pre-wrap;background:var(--bg3);padding:16px;border-radius:6px;font-size:.85rem;max-height:400px;overflow-y:auto">{{ export_result }}</pre>
-  <button class="btn btn-sm mt-2" onclick="navigator.clipboard.writeText(document.querySelector('pre').textContent);showToast('Copied to clipboard','success')">Copy to Clipboard</button>
+  <pre id="export-output" style="white-space:pre-wrap;background:var(--bg3);padding:16px;border-radius:6px;font-size:.85rem;max-height:400px;overflow-y:auto">{{ export_result }}</pre>
+  <div class="btn-group mt-2">
+    <button class="btn btn-sm" onclick="navigator.clipboard.writeText(document.getElementById('export-output').textContent);showToast('Copied to clipboard','success')">Copy to Clipboard</button>
+    <button class="btn btn-sm btn-primary" onclick="(function(){var t=document.getElementById('export-output').textContent;var ext=t.trim().startsWith('<!DOCTYPE')||t.trim().startsWith('<html')?'.html':t.trim().startsWith('#')?'.md':'.txt';var blob=new Blob([t],{type:'text/plain'});var a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='epstein_report_'+new Date().toISOString().slice(0,10)+ext;a.click();URL.revokeObjectURL(a.href);showToast('Download started','success')})()">Download as File</button>
+  </div>
 </div>
 {% endif %}
 {% endblock %}
@@ -2046,21 +2083,66 @@ def export_report():
 
     report_findings = query_all(f"SELECT * FROM findings WHERE {where} ORDER BY category, created_at DESC")
 
-    lines = ["# EpsteinAnalyzer Investigation Report", f"Generated: {datetime.now(tz=timezone.utc).isoformat()}", ""]
-    current_cat = None
-    for f in report_findings:
-        if f["category"] != current_cat:
-            current_cat = f["category"]
-            lines.append(f"\n## {(current_cat or 'Other').replace('_', ' ').title()}\n")
-        lines.append(f"### {f['title']}")
-        lines.append(f"Confidence: {f['confidence_level']}")
-        if f.get("summary"):
-            lines.append(f"\n{f['summary']}")
-        if f.get("detailed_notes"):
-            lines.append(f"\n{f['detailed_notes']}")
-        lines.append("")
-
-    export_result = "\n".join(lines)
+    if fmt == "html":
+        lines = [
+            "<!DOCTYPE html><html><head><title>EpsteinAnalyzer Investigation Report</title>",
+            "<style>body{font-family:sans-serif;max-width:900px;margin:40px auto;background:#111;color:#eee;padding:20px}",
+            "h1{color:#58a6ff}h2{color:#3fb950;border-bottom:1px solid #333;padding-bottom:6px}h3{color:#e6edf3}",
+            ".confidence{display:inline-block;padding:2px 8px;border-radius:4px;font-size:.82rem;margin-bottom:8px}",
+            ".confirmed{background:#238636;color:#fff}.likely{background:#9e6a03;color:#fff}.unverified{background:#30363d;color:#8b949e}",
+            "p{line-height:1.6;color:#c9d1d9}</style></head><body>",
+            f"<h1>EpsteinAnalyzer Investigation Report</h1>",
+            f"<p style='color:#8b949e'>Generated: {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}</p>",
+        ]
+        current_cat = None
+        for f in report_findings:
+            if f["category"] != current_cat:
+                current_cat = f["category"]
+                lines.append(f"<h2>{html.escape((current_cat or 'Other').replace('_', ' ').title())}</h2>")
+            lines.append(f"<h3>{html.escape(f['title'])}</h3>")
+            conf = f['confidence_level'] or 'unverified'
+            lines.append(f"<span class='confidence {html.escape(conf)}'>{html.escape(conf)}</span>")
+            if f.get("summary"):
+                lines.append(f"<p>{html.escape(f['summary'])}</p>")
+            if f.get("detailed_notes"):
+                lines.append(f"<p>{html.escape(f['detailed_notes'])}</p>")
+        lines.append("</body></html>")
+        export_result = "\n".join(lines)
+    elif fmt == "txt":
+        lines = [
+            "EPSTEIN ANALYZER INVESTIGATION REPORT",
+            f"Generated: {datetime.now(tz=timezone.utc).isoformat()}",
+            "=" * 60, "",
+        ]
+        current_cat = None
+        for f in report_findings:
+            if f["category"] != current_cat:
+                current_cat = f["category"]
+                cat_title = (current_cat or "Other").replace("_", " ").upper()
+                lines.extend(["", "-" * 40, cat_title, "-" * 40, ""])
+            lines.append(f['title'])
+            lines.append(f"  Confidence: {f['confidence_level']}")
+            if f.get("summary"):
+                lines.append(f"  {f['summary']}")
+            if f.get("detailed_notes"):
+                lines.append(f"  {f['detailed_notes']}")
+            lines.append("")
+        export_result = "\n".join(lines)
+    else:
+        lines = ["# EpsteinAnalyzer Investigation Report", f"Generated: {datetime.now(tz=timezone.utc).isoformat()}", ""]
+        current_cat = None
+        for f in report_findings:
+            if f["category"] != current_cat:
+                current_cat = f["category"]
+                lines.append(f"\n## {(current_cat or 'Other').replace('_', ' ').title()}\n")
+            lines.append(f"### {f['title']}")
+            lines.append(f"Confidence: {f['confidence_level']}")
+            if f.get("summary"):
+                lines.append(f"\n{f['summary']}")
+            if f.get("detailed_notes"):
+                lines.append(f"\n{f['detailed_notes']}")
+            lines.append("")
+        export_result = "\n".join(lines)
     findings = query_all("SELECT id, title FROM findings ORDER BY created_at DESC")
     return render_template_string(EXPORT_HTML, active="export", findings=findings, export_result=export_result)
 
@@ -2201,6 +2283,121 @@ def settings_page():
 
 
 # ============================================================================
+#  13. AUDIT LOG  (/audit)
+# ============================================================================
+
+AUDIT_HTML = r"""{% extends "base.html" %}
+{% block title %}Audit Log - EpsteinAnalyzer{% endblock %}
+{% block content %}
+<h1>Audit Log</h1>
+<p class="subtitle">{{ total_entries }} total entries</p>
+
+<div class="card mb-2">
+  <form method="get" action="/audit" class="flex gap-1">
+    <select name="action" style="width:200px">
+      <option value="">All Actions</option>
+      {% for a in action_types %}
+      <option value="{{ a }}" {% if a == filter_action %}selected{% endif %}>{{ a }}</option>
+      {% endfor %}
+    </select>
+    <select name="source" style="width:140px">
+      <option value="">All Sources</option>
+      <option value="user" {% if filter_source == 'user' %}selected{% endif %}>User</option>
+      <option value="system" {% if filter_source == 'system' %}selected{% endif %}>System</option>
+    </select>
+    <input type="search" name="q" value="{{ q }}" placeholder="Search details..." style="flex:1">
+    <button class="btn btn-primary" type="submit">Filter</button>
+  </form>
+</div>
+
+<div class="card">
+  <table>
+    <thead><tr><th>Time</th><th>Action</th><th>Details</th><th>Source</th></tr></thead>
+    <tbody>
+    {% for log in audit_logs %}
+    <tr>
+      <td class="mono text-muted" style="font-size:.78rem;white-space:nowrap">{{ log.created_at }}</td>
+      <td><span class="tag tag-blue">{{ log.action }}</span></td>
+      <td class="truncate" style="max-width:500px;font-size:.88rem" title="{{ log.details or '' }}">{{ log.details or '' }}</td>
+      <td>{% if log.user_initiated %}<span class="tag tag-green">User</span>{% else %}<span class="tag tag-purple">System</span>{% endif %}</td>
+    </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+  {% if not audit_logs %}
+  <p class="text-muted" style="padding:20px;text-align:center">No audit log entries match your filters.</p>
+  {% endif %}
+</div>
+
+{% if total_pages > 1 %}
+<div class="flex gap-1 mt-2" style="justify-content:center;align-items:center">
+  {% if page > 1 %}
+  <a href="/audit?page={{ page - 1 }}&action={{ filter_action }}&source={{ filter_source }}&q={{ q }}" class="btn btn-sm">&larr; Prev</a>
+  {% endif %}
+  <span class="text-muted" style="font-size:.85rem">Page {{ page }} of {{ total_pages }}</span>
+  {% if page < total_pages %}
+  <a href="/audit?page={{ page + 1 }}&action={{ filter_action }}&source={{ filter_source }}&q={{ q }}" class="btn btn-sm">Next &rarr;</a>
+  {% endif %}
+</div>
+{% endif %}
+{% endblock %}
+"""
+
+
+@app.route("/audit")
+def audit_page():
+    page = max(1, int(request.args.get("page", 1)))
+    per_page = 50
+    filter_action = request.args.get("action", "").strip()
+    filter_source = request.args.get("source", "").strip()
+    q = request.args.get("q", "").strip()
+
+    conditions = []
+    params = []
+    if filter_action:
+        conditions.append("action = ?")
+        params.append(filter_action)
+    if filter_source == "user":
+        conditions.append("user_initiated = 1")
+    elif filter_source == "system":
+        conditions.append("user_initiated = 0")
+    if q:
+        conditions.append(r"details LIKE ? ESCAPE '\'")
+        params.append(f"%{escape_like(q)}%")
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+
+    total_entries = query_scalar(
+        f"SELECT COUNT(*) FROM audit_log WHERE {where}", tuple(params)
+    )
+    total_pages = max(1, (total_entries + per_page - 1) // per_page)
+    page = min(page, total_pages)
+
+    audit_logs = query_all(
+        f"SELECT * FROM audit_log WHERE {where} ORDER BY created_at DESC LIMIT ? OFFSET ?",
+        tuple(params) + (per_page, (page - 1) * per_page),
+    )
+
+    action_types = [
+        r["action"]
+        for r in query_all("SELECT DISTINCT action FROM audit_log ORDER BY action")
+    ]
+
+    return render_template_string(
+        AUDIT_HTML,
+        active="audit",
+        audit_logs=audit_logs,
+        action_types=action_types,
+        filter_action=filter_action,
+        filter_source=filter_source,
+        q=q,
+        page=page,
+        total_pages=total_pages,
+        total_entries=total_entries,
+    )
+
+
+# ============================================================================
 #  API ROUTES
 # ============================================================================
 
@@ -2298,6 +2495,17 @@ def api_search():
     q = request.args.get("q", "").strip()
     if not q:
         return jsonify({"results": []})
+    fts_query = sanitize_fts(q)
+    if fts_query is None:
+        # Query had no searchable characters; fall back to LIKE directly
+        results = query_all(
+            r"""SELECT document_id, page_number, substr(text_content, 1, 200) as snippet
+               FROM document_pages
+               WHERE text_content LIKE ? ESCAPE '\'
+               LIMIT 50""",
+            (f"%{escape_like(q)}%",),
+        )
+        return jsonify({"query": q, "results": results})
     try:
         results = query_all(
             """SELECT dp.document_id, dp.page_number,
@@ -2306,7 +2514,7 @@ def api_search():
                JOIN document_pages dp ON dp.id = document_text_fts.rowid
                WHERE document_text_fts MATCH ?
                LIMIT 50""",
-            (sanitize_fts(q),),
+            (fts_query,),
         )
     except Exception:
         # FTS might not be populated; fall back to LIKE

@@ -228,11 +228,14 @@ class ModelRunner(ABC):
         """Test whether the CLI tool responds at all."""
         try:
             cmd = shutil.which(self.cli_command) or self.cli_command
+            # On Windows, .cmd/.bat files require shell=True to execute
+            use_shell = sys.platform == "win32" and cmd.lower().endswith((".cmd", ".bat"))
             result = subprocess.run(
                 [cmd, "--help"],
                 capture_output=True,
                 text=True,
                 timeout=15,
+                shell=use_shell,
             )
             return result.returncode in (0, 1, 2)  # --help may exit 1 or 2
         except FileNotFoundError:
@@ -262,6 +265,10 @@ class ModelRunner(ABC):
             tmp.close()
 
             cmd = self._build_command(tmp.name)
+            # Resolve the executable path (handles Windows .cmd/.bat wrappers)
+            resolved = shutil.which(cmd[0]) or cmd[0]
+            cmd[0] = resolved
+            use_shell = sys.platform == "win32" and resolved.lower().endswith((".cmd", ".bat"))
             logger.info("Running %s  (timeout=%ds)", self.get_name(), timeout)
             start = time.monotonic()
 
@@ -273,6 +280,7 @@ class ModelRunner(ABC):
                     capture_output=True,
                     text=True,
                     timeout=timeout,
+                    shell=use_shell,
                 )
             elapsed = time.monotonic() - start
             logger.info("%s completed in %.1fs (exit=%d)", self.get_name(), elapsed, result.returncode)
@@ -304,9 +312,14 @@ class ModelRunner(ABC):
             if tmp is not None:
                 try:
                     # Overwrite with random data before deleting (prompt may contain sensitive text)
+                    # Use chunked writes to avoid memory spikes on large prompts
                     tmp_size = os.path.getsize(tmp.name)
                     with open(tmp.name, "wb") as wf:
-                        wf.write(os.urandom(tmp_size))
+                        remaining = tmp_size
+                        while remaining > 0:
+                            chunk = min(remaining, 65536)
+                            wf.write(os.urandom(chunk))
+                            remaining -= chunk
                     os.unlink(tmp.name)
                 except OSError:
                     pass
