@@ -264,13 +264,15 @@ class ModelRunner(ABC):
             logger.info("Running %s  (timeout=%ds)", self.get_name(), timeout)
             start = time.monotonic()
 
-            result = subprocess.run(
-                cmd,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                shell=(os.name == "nt"),
-            )
+            # Use stdin file handle instead of shell piping to avoid injection
+            with open(tmp.name, "r", encoding="utf-8") as stdin_fh:
+                result = subprocess.run(
+                    cmd,
+                    stdin=stdin_fh,
+                    capture_output=True,
+                    text=True,
+                    timeout=timeout,
+                )
             elapsed = time.monotonic() - start
             logger.info("%s completed in %.1fs (exit=%d)", self.get_name(), elapsed, result.returncode)
 
@@ -320,13 +322,8 @@ class CodexRunner(ModelRunner):
         return "codex"
 
     def _build_command(self, prompt_file: str) -> list[str]:
-        # codex reads a prompt from a file passed as an argument.
-        # Usage: codex < prompt_file   OR   codex "$(cat prompt_file)"
-        # Safest cross-platform: pipe via stdin is not directly list-friendly,
-        # so we use shell redirection on Windows or a wrapper.
-        if os.name == "nt":
-            return [f'type "{prompt_file}" | codex']
-        return ["sh", "-c", f'cat "{prompt_file}" | codex']
+        # Reads from stdin (file handle passed by run()); no shell piping needed
+        return ["codex", "exec"]
 
 
 class GeminiRunner(ModelRunner):
@@ -339,9 +336,7 @@ class GeminiRunner(ModelRunner):
         return "gemini"
 
     def _build_command(self, prompt_file: str) -> list[str]:
-        if os.name == "nt":
-            return [f'type "{prompt_file}" | gemini']
-        return ["sh", "-c", f'cat "{prompt_file}" | gemini']
+        return ["gemini", "-p", "-"]
 
 
 class ClaudeRunner(ModelRunner):
@@ -354,10 +349,7 @@ class ClaudeRunner(ModelRunner):
         return "claude"
 
     def _build_command(self, prompt_file: str) -> list[str]:
-        # claude --print reads prompt from stdin and prints response
-        if os.name == "nt":
-            return [f'type "{prompt_file}" | claude --print']
-        return ["sh", "-c", f'cat "{prompt_file}" | claude --print']
+        return ["claude", "--print"]
 
 
 # ===================================================================

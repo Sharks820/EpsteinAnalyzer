@@ -331,11 +331,20 @@ class SourceModule(ABC):
     def _safe_filename(self, name: str) -> str:
         """Sanitise a filename to be filesystem-safe."""
         name = re.sub(r'[<>:"/\\|?*]', "_", name)
+        # Block path traversal
+        name = name.replace("..", "_")
         name = name.strip(". ")
+        # Block Windows reserved device names
+        _RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
+            f"{d}{n}" for d in ("COM", "LPT") for n in range(1, 10)
+        }
+        stem = Path(name).stem.upper()
+        if stem in _RESERVED:
+            name = f"_{name}"
         if len(name) > 200:
             base, ext = os.path.splitext(name)
             name = base[:200] + ext
-        return name
+        return name or "_unnamed"
 
 
 # ===================================================================
@@ -626,6 +635,9 @@ class GitHubMirror(SourceModule):
 
     def _clone_or_pull(self, repo_url: str, dest: Path) -> Path:
         """Clone a repo, or pull if it already exists locally."""
+        # Validate URL to prevent command injection via flag-style strings
+        if not repo_url.startswith(("https://", "http://")):
+            raise ValueError(f"Refusing to clone non-HTTP URL: {repo_url!r}")
         repo_name = repo_url.rstrip("/").split("/")[-1]
         local = dest / repo_name
         if (local / ".git").exists():
@@ -658,6 +670,16 @@ class GitHubMirror(SourceModule):
         for root, _dirs, files in os.walk(local):
             for fname in files:
                 fp = Path(root) / fname
+                # Prevent symlink-based path traversal / exfiltration
+                try:
+                    resolved = fp.resolve()
+                    if not str(resolved).startswith(str(local.resolve())):
+                        self.logger.warning("Skipping symlink outside repo: %s -> %s", fp, resolved)
+                        continue
+                except OSError:
+                    continue
+                if fp.is_symlink():
+                    continue
                 ext = fp.suffix.lower()
                 if ext in (".pdf", ".jpg", ".jpeg", ".png", ".gif",
                            ".mp4", ".mp3", ".doc", ".docx", ".zip",
@@ -1431,6 +1453,10 @@ class TorrentEngine(SourceModule):
         Download a single magnet link to *dest_dir*.
         Returns the path to the downloaded content or None on failure.
         """
+        # Validate magnet URI to prevent command injection
+        if not magnet_uri.startswith("magnet:"):
+            self.logger.error("Refusing non-magnet URI: %s", magnet_uri[:80])
+            return None
         if not self._backend:
             self.logger.error("No torrent backend available")
             return None
@@ -2249,11 +2275,18 @@ class HarvesterEngine:
     @staticmethod
     def _safe_filename(name: str) -> str:
         name = re.sub(r'[<>:"/\\|?*]', "_", name)
+        name = name.replace("..", "_")
         name = name.strip(". ")
+        _RESERVED = {"CON", "PRN", "AUX", "NUL"} | {
+            f"{d}{n}" for d in ("COM", "LPT") for n in range(1, 10)
+        }
+        stem = Path(name).stem.upper()
+        if stem in _RESERVED:
+            name = f"_{name}"
         if len(name) > 200:
             base, ext = os.path.splitext(name)
             name = base[:200] + ext
-        return name
+        return name or "_unnamed"
 
 
 # ===================================================================

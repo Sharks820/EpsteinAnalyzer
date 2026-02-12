@@ -1,0 +1,39 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+.eggs/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# Data files (large, don't commit)
+data/
+*.sqlite3
+*.db
+
+# Security sensitive
+*.key
+*.pem
+.env
+secrets/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Temp files
+*.tmp
+*.bak
+analysis_queue/
