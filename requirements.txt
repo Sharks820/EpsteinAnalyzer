@@ -19,7 +19,7 @@ lxml==5.3.0
 
 # NLP & Entity Extraction
 spacy==3.8.4
-en-core-web-trf==3.8.0
+# en-core-web-trf is installed via: python -m spacy download en_core_web_trf
 
 # Knowledge Graph & Visualization
 networkx==3.4.2

@@ -25,6 +25,12 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import fitz  # PyMuPDF
 import pytesseract
 import yaml
+
+# Set Tesseract path explicitly on Windows
+if sys.platform == "win32":
+    _tess_path = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+    if os.path.isfile(_tess_path):
+        pytesseract.pytesseract.tesseract_cmd = _tess_path
 from PIL import Image, ExifTags
 
 try:
