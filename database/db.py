@@ -16,7 +16,11 @@ DB_NAME = "epstein_analyzer.db"
 class DatabaseManager:
     def __init__(self, config_path: str = None):
         self.config = self._load_config(config_path)
-        self.data_dir = Path(self.config["project"]["data_dir"]).resolve()
+        raw_data_dir = Path(self.config["project"]["data_dir"])
+        # Resolve relative paths against the project root, not CWD
+        if not raw_data_dir.is_absolute():
+            raw_data_dir = Path(__file__).parent.parent / raw_data_dir
+        self.data_dir = raw_data_dir.resolve()
         self.db_path = self.data_dir / DB_NAME
         self.max_bytes = self.config["project"]["max_disk_gb"] * (1024 ** 3)
         self.compact_threshold = self.config["project"]["auto_compact_threshold"]
@@ -42,11 +46,12 @@ class DatabaseManager:
             d.mkdir(parents=True, exist_ok=True)
 
     def get_connection(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = sqlite3.connect(str(self.db_path), timeout=30)
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA cache_size=-64000")  # 64MB cache
+        conn.execute("PRAGMA busy_timeout=30000")  # 30s retry on lock
         return conn
 
     def initialize(self):

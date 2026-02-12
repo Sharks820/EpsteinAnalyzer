@@ -1086,6 +1086,10 @@ class PipelineEngine:
 
         # 4. Build prompt
         document_text = self._get_document_text(document_id)
+        if document_text.startswith("(No extracted text"):
+            logger.warning("Document %d has no extracted text — skipping AI analysis", document_id)
+            self._update_doc_status(document_id, "ocr_complete")
+            return {"error": "No text content available for analysis", "skipped": True}
         metadata = {
             "filename": doc["original_filename"],
             "file_type": doc["file_type"],
@@ -1337,6 +1341,15 @@ class PipelineEngine:
     ):
         conn = self.db.get_connection()
         try:
+            # Prevent duplicate analyses for same document+model
+            existing = conn.execute(
+                "SELECT id FROM ai_analyses WHERE document_id = ? AND model_name = ?",
+                (document_id, model_name),
+            ).fetchone()
+            if existing:
+                logger.debug("Skipping duplicate %s analysis for document %d", model_name, document_id)
+                return
+
             conn.execute("""
                 INSERT INTO ai_analyses (
                     document_id, model_name, summary, entities_found,
@@ -1420,33 +1433,30 @@ class PipelineEngine:
                 canonical = re.sub(r"\s+", " ", name).strip().title()
                 google_url = ent.get("search_url", f"https://www.google.com/search?q={canonical.replace(' ', '+')}")
 
-                # Upsert entity
+                # Atomic upsert: try INSERT OR IGNORE then UPDATE, avoiding race conditions
+                role = None
+                roles_list = consensus.get("career_roles") or []
+                for cr in roles_list:
+                    if isinstance(cr, dict) and self._names_match(cr.get("name", ""), name):
+                        role = cr.get("role")
+                        break
+
+                conn.execute("""
+                    INSERT OR IGNORE INTO entities (name, entity_type, canonical_name, google_url,
+                                          role, document_count, first_seen_document_id, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
+                """, (name, etype, canonical, google_url, role, document_id, now, now))
+
+                # Whether INSERT succeeded or was ignored, fetch the ID and bump count
                 existing = conn.execute(
                     "SELECT id FROM entities WHERE canonical_name = ? AND entity_type = ?",
                     (canonical, etype),
                 ).fetchone()
-
-                if existing:
-                    eid = existing["id"]
-                    conn.execute(
-                        "UPDATE entities SET document_count = document_count + 1, updated_at = ? WHERE id = ?",
-                        (now, eid),
-                    )
-                else:
-                    role = None
-                    # Check career_roles for this entity
-                    roles_list = consensus.get("career_roles") or []
-                    for cr in roles_list:
-                        if isinstance(cr, dict) and self._names_match(cr.get("name", ""), name):
-                            role = cr.get("role")
-                            break
-
-                    cursor = conn.execute("""
-                        INSERT INTO entities (name, entity_type, canonical_name, google_url,
-                                              role, document_count, first_seen_document_id, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
-                    """, (name, etype, canonical, google_url, role, document_id, now, now))
-                    eid = cursor.lastrowid
+                eid = existing["id"]
+                conn.execute(
+                    "UPDATE entities SET document_count = document_count + 1, updated_at = ? WHERE id = ?",
+                    (now, eid),
+                )
 
                 entity_id_map[canonical.lower()] = eid
 
@@ -1524,6 +1534,8 @@ class PipelineEngine:
                 if candidates:
                     ai_candidates_json = json.dumps(candidates, default=str)
                     # Update any matching redaction record for this document
+                    # AI indices are 1-based (REDACTION #1, #2, ...), OFFSET is 0-based
+                    offset = max(0, ri.get("index", 1) - 1)
                     conn.execute("""
                         UPDATE redactions
                         SET ai_candidates = ?,
@@ -1533,7 +1545,7 @@ class PipelineEngine:
                             SELECT id FROM redactions WHERE document_id = ?
                             ORDER BY id LIMIT 1 OFFSET ?
                         )
-                    """, (ai_candidates_json, now, document_id, document_id, ri.get("index", 0)))
+                    """, (ai_candidates_json, now, document_id, document_id, offset))
 
             conn.commit()
             logger.info("Knowledge graph updated for document %d (%d entities, %d connections)",
@@ -1626,7 +1638,17 @@ class PipelineEngine:
     def _names_match(a: str, b: str) -> bool:
         na = re.sub(r"\s+", " ", a).strip().lower()
         nb = re.sub(r"\s+", " ", b).strip().lower()
-        return na == nb or na in nb or nb in na
+        if not na or not nb:
+            return False
+        if na == nb:
+            return True
+        # Require at least 4 characters for substring matching to avoid
+        # false positives like "Al" matching "Alan Dershowitz"
+        if len(na) >= 4 and na in nb:
+            return True
+        if len(nb) >= 4 and nb in na:
+            return True
+        return False
 
 
 # ===================================================================

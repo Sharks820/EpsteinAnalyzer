@@ -913,8 +913,8 @@ def serve_file(doc_id):
     if not doc or not doc.get("file_path"):
         abort(404)
     fp = Path(doc["file_path"]).resolve()
-    # Prevent path traversal: file must be inside the project data directory
-    data_dir = (PROJECT_ROOT / "data").resolve()
+    # Prevent path traversal: file must be inside the configured data directory
+    data_dir = _get_db().data_dir.resolve()
     if not fp.is_relative_to(data_dir):
         abort(403)
     if not fp.exists():
@@ -1843,7 +1843,7 @@ def serve_image(image_id):
     if image.get("quarantined") or image.get("minor_detected"):
         abort(403)
     fp = Path(image["file_path"]).resolve()
-    data_dir = (PROJECT_ROOT / "data").resolve()
+    data_dir = _get_db().data_dir.resolve()
     if not fp.is_relative_to(data_dir):
         abort(403)
     if not fp.exists():

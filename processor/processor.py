@@ -15,10 +15,8 @@ import json
 import logging
 import os
 import re
-import struct
 import sys
 import time
-import urllib.parse
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path

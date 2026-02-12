@@ -2001,6 +2001,8 @@ def rebuild_graph(config_path: str = None):
     1. Recalculate all entity scores.
     2. Remap all document connections.
     3. Run all pattern detectors.
+
+    Uses a status flag so interrupted rebuilds are detected and restarted.
     """
     engine = GraphEngine(config_path)
     scorer = EvidenceScorer(engine)
@@ -2008,57 +2010,62 @@ def rebuild_graph(config_path: str = None):
     detector = PatternDetector(engine)
     redaction = RedactionResolver(engine)
 
-    conn = engine.db.get_connection()
+    # Mark rebuild in progress so interrupted rebuilds can be detected
+    engine.db.log_action("graph_rebuild_start", "Knowledge graph rebuild started.", user_initiated=False)
+
     try:
+        # Pre-fetch all IDs in one connection to reduce round-trips
+        conn = engine.db.get_connection()
+        try:
+            links = conn.execute(
+                """SELECT edl.entity_id, edl.document_id, edl.evidence_type,
+                          edl.context_snippet
+                   FROM entity_document_links edl"""
+            ).fetchall()
+            doc_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM documents WHERE analysis_completed = 1"
+            ).fetchall()]
+            entity_ids = [r["id"] for r in conn.execute(
+                "SELECT id FROM entities"
+            ).fetchall()]
+        finally:
+            conn.close()
+
         # 1. Score every evidence item
-        logger.info("[rebuild] Scoring all evidence items...")
-        links = conn.execute(
-            """SELECT edl.entity_id, edl.document_id, edl.evidence_type,
-                      edl.context_snippet
-               FROM entity_document_links edl"""
-        ).fetchall()
-    finally:
-        conn.close()
+        logger.info("[rebuild] Scoring %d evidence items...", len(links))
+        for lnk in links:
+            scorer.score_evidence_item(
+                lnk["entity_id"],
+                lnk["document_id"],
+                lnk["evidence_type"] or "other",
+                lnk["context_snippet"] or "",
+            )
 
-    for lnk in links:
-        scorer.score_evidence_item(
-            lnk["entity_id"],
-            lnk["document_id"],
-            lnk["evidence_type"] or "other",
-            lnk["context_snippet"] or "",
-        )
+        # 2. Map document connections
+        logger.info("[rebuild] Mapping connections for %d documents...", len(doc_ids))
+        for did in doc_ids:
+            mapper.map_document_connections(did)
 
-    # 2. Map document connections
-    logger.info("[rebuild] Mapping document connections...")
-    conn = engine.db.get_connection()
-    try:
-        docs = conn.execute("SELECT id FROM documents WHERE analysis_completed = 1").fetchall()
-    finally:
-        conn.close()
-    for doc in docs:
-        mapper.map_document_connections(doc["id"])
+        # 3. Recalculate all entity scores
+        logger.info("[rebuild] Recalculating %d entity scores...", len(entity_ids))
+        for eid in entity_ids:
+            scorer.recalculate_entity_score(eid)
 
-    # 3. Recalculate all entity scores
-    logger.info("[rebuild] Recalculating entity implication scores...")
-    conn = engine.db.get_connection()
-    try:
-        entities = conn.execute("SELECT id FROM entities").fetchall()
-    finally:
-        conn.close()
-    for ent in entities:
-        scorer.recalculate_entity_score(ent["id"])
+        # 4. Detect patterns
+        logger.info("[rebuild] Running pattern detectors...")
+        detector.detect_all()
 
-    # 4. Detect patterns
-    logger.info("[rebuild] Running pattern detectors...")
-    detector.detect_all()
+        # 5. Re-evaluate redactions
+        logger.info("[rebuild] Re-evaluating redaction candidates...")
+        redaction.re_evaluate_all()
 
-    # 5. Re-evaluate redactions
-    logger.info("[rebuild] Re-evaluating redaction candidates...")
-    redaction.re_evaluate_all()
-
-    engine.invalidate_cache()
-    logger.info("[rebuild] Knowledge graph rebuild complete.")
-    engine.db.log_action("graph_rebuild", "Full knowledge graph rebuild completed.", user_initiated=False)
+        engine.invalidate_cache()
+        logger.info("[rebuild] Knowledge graph rebuild complete.")
+        engine.db.log_action("graph_rebuild", "Full knowledge graph rebuild completed.", user_initiated=False)
+    except Exception:
+        engine.db.log_action("graph_rebuild_failed", "Knowledge graph rebuild interrupted.", user_initiated=False)
+        logger.exception("[rebuild] Knowledge graph rebuild failed!")
+        raise
 
 
 # ===================================================================
