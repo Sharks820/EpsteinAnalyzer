@@ -32,7 +32,7 @@ import sqlite3
 import textwrap
 import zipfile
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
@@ -52,7 +52,7 @@ logger = logging.getLogger("export.exporter")
 
 def _now_iso() -> str:
     """Return current UTC time as an ISO-8601 string."""
-    return datetime.utcnow().isoformat()
+    return datetime.now(tz=timezone.utc).isoformat()
 
 
 def _json_loads_safe(text: Optional[str], default=None):

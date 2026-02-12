@@ -1,7 +1,7 @@
 """
 EpsteinAnalyzer - Security Module
 Encryption, integrity monitoring, backups, session wipe, honeypots.
-AES-256-GCM encryption at rest with Argon2id key derivation.
+AES-256-GCM encryption at rest with Scrypt key derivation.
 """
 import os
 import sys
@@ -12,7 +12,7 @@ import secrets
 import struct
 import logging
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
@@ -31,10 +31,10 @@ class EncryptionManager:
     SALT_SIZE = 32
     NONCE_SIZE = 12
     KEY_SIZE = 32  # 256 bits
+    CHUNK_SIZE = 64 * 1024  # 64 KB chunks for streaming file encryption
 
     def __init__(self):
-        self._cached_key = None
-        self._cached_salt = None
+        pass
 
     def derive_key(self, password: str, salt: bytes = None) -> tuple:
         if salt is None:
@@ -67,25 +67,52 @@ class EncryptionManager:
         return aesgcm.decrypt(nonce, ciphertext, None)
 
     def encrypt_file(self, file_path: str, password: str, output_path: str = None):
+        """Encrypt a file using chunked I/O to avoid loading entire file into memory."""
         file_path = Path(file_path)
         if output_path is None:
             output_path = str(file_path) + ".enc"
-        with open(file_path, "rb") as f:
-            data = f.read()
-        encrypted = self.encrypt_data(data, password)
-        with open(output_path, "wb") as f:
-            f.write(encrypted)
+        key, salt = self.derive_key(password)
+        aesgcm = AESGCM(key)
+        with open(file_path, "rb") as fin, open(output_path, "wb") as fout:
+            fout.write(salt)
+            chunk_idx = 0
+            while True:
+                chunk = fin.read(self.CHUNK_SIZE)
+                if not chunk:
+                    break
+                nonce = chunk_idx.to_bytes(self.NONCE_SIZE, "big")
+                ct = aesgcm.encrypt(nonce, chunk, None)
+                fout.write(len(ct).to_bytes(4, "big"))
+                fout.write(nonce)
+                fout.write(ct)
+                chunk_idx += 1
         return output_path
 
     def decrypt_file(self, file_path: str, password: str, output_path: str = None):
+        """Decrypt a file using chunked I/O to avoid loading entire file into memory."""
         file_path = Path(file_path)
         if output_path is None:
-            output_path = str(file_path).replace(".enc", "")
-        with open(file_path, "rb") as f:
-            encrypted = f.read()
-        data = self.decrypt_data(encrypted, password)
-        with open(output_path, "wb") as f:
-            f.write(data)
+            # Properly strip .enc suffix instead of brittle .replace()
+            if file_path.suffix == ".enc":
+                output_path = str(file_path.with_suffix(""))
+            else:
+                output_path = str(file_path) + ".dec"
+        with open(file_path, "rb") as fin:
+            salt = fin.read(self.SALT_SIZE)
+            if len(salt) < self.SALT_SIZE:
+                raise ValueError("Invalid encrypted file: too short for salt")
+            key, _ = self.derive_key(password, salt)
+            aesgcm = AESGCM(key)
+            with open(output_path, "wb") as fout:
+                while True:
+                    ct_len_bytes = fin.read(4)
+                    if not ct_len_bytes or len(ct_len_bytes) < 4:
+                        break
+                    ct_len = int.from_bytes(ct_len_bytes, "big")
+                    nonce = fin.read(self.NONCE_SIZE)
+                    ct = fin.read(ct_len)
+                    plaintext = aesgcm.decrypt(nonce, ct, None)
+                    fout.write(plaintext)
         return output_path
 
 
@@ -116,7 +143,7 @@ class IntegrityMonitor:
                 """INSERT OR REPLACE INTO file_integrity
                    (file_path, sha256_hash, size_bytes, last_verified_at, is_honeypot)
                    VALUES (?, ?, ?, ?, ?)""",
-                (file_path, file_hash, file_size, datetime.utcnow().isoformat(), is_honeypot),
+                (file_path, file_hash, file_size, datetime.now(tz=timezone.utc).isoformat(), is_honeypot),
             )
             conn.commit()
         finally:
@@ -127,68 +154,60 @@ class IntegrityMonitor:
         conn = self.db.get_connection()
         try:
             rows = conn.execute("SELECT * FROM file_integrity").fetchall()
-        finally:
-            conn.close()
 
-        results = {
-            "total_files": len(rows),
-            "verified": 0,
-            "tampered": [],
-            "missing": [],
-            "honeypot_triggered": [],
-        }
+            results = {
+                "total_files": len(rows),
+                "verified": 0,
+                "tampered": [],
+                "missing": [],
+                "honeypot_triggered": [],
+            }
 
-        for row in rows:
-            file_path = row["file_path"]
-            if not os.path.exists(file_path):
-                results["missing"].append({
-                    "path": file_path,
-                    "is_honeypot": bool(row["is_honeypot"]),
-                })
-                continue
+            now = datetime.now(tz=timezone.utc).isoformat()
 
-            current_hash = self.hash_file(file_path)
-            current_size = os.path.getsize(file_path)
+            for row in rows:
+                file_path = row["file_path"]
+                if not os.path.exists(file_path):
+                    results["missing"].append({
+                        "path": file_path,
+                        "is_honeypot": bool(row["is_honeypot"]),
+                    })
+                    continue
 
-            if current_hash != row["sha256_hash"] or current_size != row["size_bytes"]:
-                alert = {
-                    "path": file_path,
-                    "expected_hash": row["sha256_hash"],
-                    "actual_hash": current_hash,
-                    "expected_size": row["size_bytes"],
-                    "actual_size": current_size,
-                    "is_honeypot": bool(row["is_honeypot"]),
-                }
+                current_hash = self.hash_file(file_path)
+                current_size = os.path.getsize(file_path)
 
-                if row["is_honeypot"]:
-                    results["honeypot_triggered"].append(alert)
-                    logger.critical(f"HONEYPOT TRIGGERED: {file_path}")
-                else:
-                    results["tampered"].append(alert)
-                    logger.warning(f"TAMPER DETECTED: {file_path}")
+                if current_hash != row["sha256_hash"] or current_size != row["size_bytes"]:
+                    alert = {
+                        "path": file_path,
+                        "expected_hash": row["sha256_hash"],
+                        "actual_hash": current_hash,
+                        "expected_size": row["size_bytes"],
+                        "actual_size": current_size,
+                        "is_honeypot": bool(row["is_honeypot"]),
+                    }
 
-                # Mark in DB
-                conn = self.db.get_connection()
-                try:
+                    if row["is_honeypot"]:
+                        results["honeypot_triggered"].append(alert)
+                        logger.critical(f"HONEYPOT TRIGGERED: {file_path}")
+                    else:
+                        results["tampered"].append(alert)
+                        logger.warning(f"TAMPER DETECTED: {file_path}")
+
                     conn.execute(
                         "UPDATE file_integrity SET tamper_detected = 1, tamper_detected_at = ? WHERE file_path = ?",
-                        (datetime.utcnow().isoformat(), file_path),
+                        (now, file_path),
                     )
-                    conn.commit()
-                finally:
-                    conn.close()
-            else:
-                results["verified"] += 1
-                # Update last verified timestamp
-                conn = self.db.get_connection()
-                try:
+                else:
+                    results["verified"] += 1
                     conn.execute(
                         "UPDATE file_integrity SET last_verified_at = ? WHERE file_path = ?",
-                        (datetime.utcnow().isoformat(), file_path),
+                        (now, file_path),
                     )
-                    conn.commit()
-                finally:
-                    conn.close()
+
+            conn.commit()
+        finally:
+            conn.close()
 
         return results
 
@@ -230,7 +249,7 @@ class HoneypotManager:
     def _generate_fake_content(self, filename: str) -> bytes:
         """Generate realistic-looking fake data for honeypot files."""
         # Mix of random bytes and plausible-looking text
-        header = f"CONFIDENTIAL - {filename}\nGenerated: {datetime.utcnow().isoformat()}\n\n"
+        header = f"CONFIDENTIAL - {filename}\nGenerated: {datetime.now(tz=timezone.utc).isoformat()}\n\n"
         fake_entries = [
             "Case Reference: SEALED\n",
             "Evidence Classification: HIGH PRIORITY\n",
@@ -272,7 +291,7 @@ class BackupManager:
         backup_path = Path(backup_path)
         backup_path.mkdir(parents=True, exist_ok=True)
 
-        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+        timestamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         backup_name = f"epstein_backup_{timestamp}"
         backup_dir = backup_path / backup_name
         backup_dir.mkdir(parents=True, exist_ok=True)
@@ -322,7 +341,7 @@ class BackupManager:
 
         # Update last backup timestamp
         last_backup_file = backup_path / ".last_backup"
-        last_backup_file.write_text(datetime.utcnow().isoformat())
+        last_backup_file.write_text(datetime.now(tz=timezone.utc).isoformat())
 
         # Log the action
         self.db.log_action(
@@ -351,7 +370,9 @@ class BackupManager:
         files_restored = 0
         for enc_file in backup_dir.rglob("*.enc"):
             rel_path = enc_file.relative_to(backup_dir)
-            dest = restore_to / str(rel_path).replace(".enc", "")
+            # Properly strip .enc suffix
+            rel_str = str(rel_path)
+            dest = restore_to / (rel_str[:-4] if rel_str.endswith(".enc") else rel_str)
             dest.parent.mkdir(parents=True, exist_ok=True)
             self.encryption.decrypt_file(str(enc_file), password, str(dest))
             files_restored += 1
@@ -382,20 +403,23 @@ class BackupManager:
         return backups
 
     def verify_backup(self, backup_dir: str, password: str) -> dict:
-        """Verify backup integrity by attempting to decrypt a sample."""
+        """Verify backup integrity by attempting to decrypt a sample.
+
+        Uses decrypt_file (chunk-aware) instead of decrypt_data so that
+        backups created with chunked encryption are verified correctly.
+        """
         backup_dir = Path(backup_dir)
         enc_files = list(backup_dir.rglob("*.enc"))
         if not enc_files:
             return {"valid": False, "error": "No encrypted files found"}
 
-        # Test decrypt first 3 files
         tested = 0
         errors = []
         for enc_file in enc_files[:3]:
             try:
-                with open(enc_file, "rb") as f:
-                    encrypted = f.read()
-                self.encryption.decrypt_data(encrypted, password)
+                dec_path = self.encryption.decrypt_file(str(enc_file), password)
+                # Clean up the temporary decrypted file
+                Path(dec_path).unlink(missing_ok=True)
                 tested += 1
             except Exception as e:
                 errors.append({"file": str(enc_file), "error": str(e)})
@@ -446,7 +470,7 @@ class SessionWiper:
                     timeout=5,
                 )
         except Exception:
-            pass
+            logger.debug("Clipboard clear failed", exc_info=True)
 
         return {"files_wiped": wiped}
 
@@ -506,6 +530,10 @@ class USBProtection:
         self.attempts_file.write_text(str(attempts))
 
         if attempts >= self.MAX_ATTEMPTS:
+            logger.critical(
+                "USB SELF-DESTRUCT: %d failed decrypt attempts on %s — wiping backup",
+                attempts, self.backup_path,
+            )
             self._self_destruct()
             return False
         return True
@@ -532,7 +560,7 @@ class USBProtection:
                     fh.write(os.urandom(size))
                 f.unlink()
             except Exception:
-                pass
+                logger.debug("Emergency lockout file cleanup failed: %s", f, exc_info=True)
         # Remove the attempts file too
         self._reset_attempts()
 
@@ -555,7 +583,7 @@ class SecurityManager:
 
     def startup_check(self) -> dict:
         """Run all security checks on startup."""
-        results = {"timestamp": datetime.utcnow().isoformat()}
+        results = {"timestamp": datetime.now(tz=timezone.utc).isoformat()}
 
         # 1. Verify file integrity
         integrity_results = self.integrity.verify_all()
@@ -598,9 +626,8 @@ class SecurityManager:
         """First-time setup — create honeypots, register critical files."""
         self.honeypots.create_honeypots()
 
-        # Register the database itself for integrity monitoring
-        db_path = self.data_dir / "epstein_analyzer.db"
-        if db_path.exists():
-            self.integrity.register_file(str(db_path))
+        # NOTE: Do NOT register the database for integrity monitoring.
+        # The DB file changes every session (inserts, updates) which would
+        # trigger false tamper alerts on every startup.
 
         self.db.log_action("security_initialized", "Honeypots created, integrity baseline set")

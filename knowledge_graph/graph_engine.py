@@ -21,7 +21,7 @@ import re
 import statistics
 import urllib.parse
 from collections import Counter, defaultdict
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from itertools import combinations
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -54,7 +54,12 @@ def _json_loads_safe(text: Optional[str], default=None):
 
 
 def _now_iso() -> str:
-    return datetime.utcnow().isoformat()
+    return datetime.now(tz=timezone.utc).isoformat()
+
+
+def _escape_like(s: str) -> str:
+    """Escape LIKE wildcard characters so user input is treated literally."""
+    return str(s).replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
 def _load_config(config_path: Optional[str] = None) -> dict:
@@ -439,7 +444,8 @@ class GraphEngine:
         """Full-text search across entity names, aliases, descriptions."""
         conn = self.db.get_connection()
         try:
-            fts_query = query.replace('"', '""')
+            # Wrap in double quotes to disable FTS5 operators
+            fts_query = '"' + query.replace('"', '""') + '"'
             if entity_type:
                 sql = """
                     SELECT e.*
@@ -463,15 +469,16 @@ class GraphEngine:
             return [dict(r) for r in rows]
         except Exception:
             # Fallback to LIKE if FTS fails (e.g. special characters)
-            like = f"%{query}%"
+            safe = query.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            like = f"%{safe}%"
             if entity_type:
                 rows = conn.execute(
-                    "SELECT * FROM entities WHERE (name LIKE ? OR canonical_name LIKE ? OR aliases LIKE ?) AND entity_type = ? ORDER BY implication_score DESC LIMIT 200",
+                    r"SELECT * FROM entities WHERE (name LIKE ? ESCAPE '\' OR canonical_name LIKE ? ESCAPE '\' OR aliases LIKE ? ESCAPE '\') AND entity_type = ? ORDER BY implication_score DESC LIMIT 200",
                     (like, like, like, entity_type),
                 ).fetchall()
             else:
                 rows = conn.execute(
-                    "SELECT * FROM entities WHERE name LIKE ? OR canonical_name LIKE ? OR aliases LIKE ? ORDER BY implication_score DESC LIMIT 200",
+                    r"SELECT * FROM entities WHERE name LIKE ? ESCAPE '\' OR canonical_name LIKE ? ESCAPE '\' OR aliases LIKE ? ESCAPE '\' ORDER BY implication_score DESC LIMIT 200",
                     (like, like, like),
                 ).fetchall()
             return [dict(r) for r in rows]
@@ -1380,8 +1387,8 @@ class RedactionResolver:
                    SET status = 'confirmed_by_user',
                        user_confirmed_value = ?,
                        updated_at = ?
-                   WHERE ai_candidates LIKE ?""",
-                (name, _now_iso(), f"%{confirmed_entity_id}%"),
+                   WHERE ai_candidates LIKE ? ESCAPE '\\' """,
+                (name, _now_iso(), f"%{_escape_like(confirmed_entity_id)}%"),
             )
             conn.commit()
         finally:
@@ -1542,9 +1549,9 @@ class TemporalAnalyzer:
                        JOIN documents d ON d.id = edl.document_id
                        LEFT JOIN email_messages em ON em.document_id = d.id
                        WHERE COALESCE(em.email_date, edl.created_at) BETWEEN ? AND ?
-                         AND (edl.context_snippet LIKE ? OR d.original_filename LIKE ?)
+                         AND (edl.context_snippet LIKE ? ESCAPE '\\' OR d.original_filename LIKE ? ESCAPE '\\')
                        ORDER BY event_date""",
-                    (date_start, date_end, f"%{location}%", f"%{location}%"),
+                    (date_start, date_end, f"%{_escape_like(location)}%", f"%{_escape_like(location)}%"),
                 ).fetchall()
             else:
                 rows = conn.execute(

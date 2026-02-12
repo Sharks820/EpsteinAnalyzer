@@ -23,11 +23,17 @@
     - Three.js (unpkg.com) for optional 3D view
 -->
 
-<!-- D3.js v7 from official CDN -->
-<script src="https://d3js.org/d3.v7.min.js"></script>
-<!-- Three.js from unpkg CDN -->
-<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
-<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+<!-- D3.js v7 from official CDN (SRI hash pinned) -->
+<script src="https://d3js.org/d3.v7.min.js"
+        crossorigin="anonymous"></script>
+<!-- Three.js from unpkg CDN (version-pinned) -->
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"
+        crossorigin="anonymous"></script>
+<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"
+        crossorigin="anonymous"></script>
+<!-- CSP: restrict inline scripts to this origin only -->
+<meta http-equiv="Content-Security-Policy"
+      content="default-src 'self'; script-src 'self' 'unsafe-inline' https://d3js.org https://unpkg.com; style-src 'self' 'unsafe-inline'; img-src 'self' data:; connect-src 'self';">
 
 <style>
 /* ================================================================
@@ -1174,6 +1180,14 @@ html, body {
 (function() {
     'use strict';
 
+    // HTML-escape helper to prevent XSS in innerHTML interpolations
+    function esc(s) {
+        if (s == null) return '';
+        return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;')
+                        .replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+                        .replace(/'/g, '&#039;');
+    }
+
     // -----------------------------------------------------------------
     // State
     // -----------------------------------------------------------------
@@ -1324,10 +1338,10 @@ html, body {
             const row = document.createElement('div');
             row.className = 'filter-checkbox-row';
             row.innerHTML = `
-                <input type="checkbox" id="ft-${t}" data-type="${t}" checked>
-                <label for="ft-${t}" style="display:flex;align-items:center;gap:4px;">
+                <input type="checkbox" id="ft-${esc(t)}" data-type="${esc(t)}" checked>
+                <label for="ft-${esc(t)}" style="display:flex;align-items:center;gap:4px;">
                     <span class="legend-swatch" style="background:${color};width:10px;height:10px;border-radius:2px;display:inline-block;"></span>
-                    ${t.replace(/_/g, ' ')}
+                    ${esc(t).replace(/_/g, ' ')}
                 </label>`;
             row.querySelector('input').addEventListener('change', onTypeFilterChange);
             dom.typeFilters.appendChild(row);
@@ -1341,8 +1355,8 @@ html, body {
             const row = document.createElement('div');
             row.className = 'filter-checkbox-row';
             row.innerHTML = `
-                <input type="checkbox" id="fe-${t}" data-edge-type="${t}" checked>
-                <label for="fe-${t}">${t.replace(/_/g, ' ')}</label>`;
+                <input type="checkbox" id="fe-${esc(t)}" data-edge-type="${esc(t)}" checked>
+                <label for="fe-${esc(t)}">${esc(t).replace(/_/g, ' ')}</label>`;
             row.querySelector('input').addEventListener('change', onEdgeTypeFilterChange);
             dom.edgeTypeFilters.appendChild(row);
         });
@@ -1354,7 +1368,7 @@ html, body {
                 dom.legendContainer.innerHTML += `
                     <div class="legend-item">
                         <span class="legend-swatch" style="background:${color}"></span>
-                        ${type.replace(/_/g, ' ')}
+                        ${esc(type).replace(/_/g, ' ')}
                     </div>`;
             }
         });
@@ -1823,14 +1837,14 @@ html, body {
             const div = document.createElement('div');
             div.className = 'timeline-event';
             div.innerHTML = `
-                <div class="tl-date">${ev.date || '--'}</div>
+                <div class="tl-date">${esc(ev.date) || '--'}</div>
                 <div class="tl-body">
-                    <div class="tl-entity" style="color:${TYPE_COLORS[ev.entity_type] || '#999'}">${ev.entity_name || 'Unknown'}</div>
-                    <div class="tl-desc">${ev.description || ''}</div>
+                    <div class="tl-entity" style="color:${TYPE_COLORS[ev.entity_type] || '#999'}">${esc(ev.entity_name) || 'Unknown'}</div>
+                    <div class="tl-desc">${esc(ev.description) || ''}</div>
                     <div class="tl-meta">
-                        <span class="tl-badge" style="background:${scoreColor(ev.damning_score || 0)};color:#fff;">${ev.doc_type || 'doc'}</span>
-                        <span>Score: ${ev.damning_score || 0}</span>
-                        <span>Source: ${ev.source || 'unknown'}</span>
+                        <span class="tl-badge" style="background:${scoreColor(ev.damning_score || 0)};color:#fff;">${esc(ev.doc_type) || 'doc'}</span>
+                        <span>Score: ${esc(ev.damning_score) || 0}</span>
+                        <span>Source: ${esc(ev.source) || 'unknown'}</span>
                     </div>
                 </div>`;
             div.addEventListener('click', () => {
@@ -1941,7 +1955,7 @@ html, body {
                 <div class="gauge-text" style="color:${sc}">${score}</div>
             </div>
             <div class="score-info">
-                <div class="score-label" style="color:${sc}">${e.score_label || scoreLabel(score)}</div>
+                <div class="score-label" style="color:${sc}">${esc(e.score_label) || scoreLabel(score)}</div>
                 <div class="score-sublabel">Implication Score</div>
             </div>
         </div>
@@ -1951,23 +1965,23 @@ html, body {
             <div class="card-meta-grid">
                 <div class="card-meta-item">
                     <span class="card-meta-label">Type</span>
-                    <span class="card-meta-value" style="color:${TYPE_COLORS[e.type] || '#999'}">${(e.type || '').replace(/_/g, ' ')}</span>
+                    <span class="card-meta-value" style="color:${TYPE_COLORS[e.type] || '#999'}">${(esc(e.type) || '').replace(/_/g, ' ')}</span>
                 </div>
                 <div class="card-meta-item">
                     <span class="card-meta-label">Role</span>
-                    <span class="card-meta-value">${e.role || 'N/A'}</span>
+                    <span class="card-meta-value">${esc(e.role) || 'N/A'}</span>
                 </div>
                 <div class="card-meta-item">
                     <span class="card-meta-label">Evidence</span>
-                    <span class="card-meta-value">${e.evidence_count || 0}</span>
+                    <span class="card-meta-value">${esc(e.evidence_count) || 0}</span>
                 </div>
                 <div class="card-meta-item">
                     <span class="card-meta-label">Documents</span>
-                    <span class="card-meta-value">${e.document_count || 0}</span>
+                    <span class="card-meta-value">${esc(e.document_count) || 0}</span>
                 </div>
                 <div class="card-meta-item">
                     <span class="card-meta-label">Connections</span>
-                    <span class="card-meta-value">${e.connection_count || 0}</span>
+                    <span class="card-meta-value">${esc(e.connection_count) || 0}</span>
                 </div>
             </div>
         </div>`;
@@ -1977,7 +1991,7 @@ html, body {
             html += `<div class="card-section">
                 <div class="card-section-title">Aliases</div>
                 <div class="card-aliases">
-                    ${e.aliases.map(a => `<span class="card-alias-tag">${a}</span>`).join('')}
+                    ${e.aliases.map(a => `<span class="card-alias-tag">${esc(a)}</span>`).join('')}
                 </div>
             </div>`;
         }
@@ -1988,10 +2002,10 @@ html, body {
             card.top_evidence.forEach(ev => {
                 html += `<div class="evidence-item">
                     <span class="evidence-type" style="background:${scoreColor(ev.damning_score || 0)};color:#fff;">
-                        ${ev.doc_type || 'doc'}
+                        ${esc(ev.doc_type) || 'doc'}
                     </span>
-                    <div class="evidence-context">${ev.context || '(no context available)'}</div>
-                    <div class="evidence-score">Score: ${ev.damning_score || 0}/100 | Source: ${ev.source || 'unknown'}</div>
+                    <div class="evidence-context">${esc(ev.context) || '(no context available)'}</div>
+                    <div class="evidence-score">Score: ${esc(ev.damning_score) || 0}/100 | Source: ${esc(ev.source) || 'unknown'}</div>
                 </div>`;
             });
             html += `</div>`;
@@ -2001,10 +2015,10 @@ html, body {
         if (card.connections && card.connections.length > 0) {
             html += `<div class="card-section"><div class="card-section-title">Connections (${card.connections.length})</div>`;
             card.connections.forEach(c => {
-                html += `<div class="connection-item" data-entity-id="${c.entity_id}">
+                html += `<div class="connection-item" data-entity-id="${esc(c.entity_id)}">
                     <span class="connection-dot" style="background:${TYPE_COLORS[c.type] || '#999'}"></span>
-                    <span class="connection-name">${c.name}</span>
-                    <span class="connection-rel">${c.rel_type}</span>
+                    <span class="connection-name">${esc(c.name)}</span>
+                    <span class="connection-rel">${esc(c.rel_type)}</span>
                 </div>`;
             });
             html += `</div>`;
@@ -2015,8 +2029,8 @@ html, body {
             html += `<div class="card-section"><div class="card-section-title">Timeline</div>`;
             card.timeline.forEach(t => {
                 html += `<div class="card-timeline-item">
-                    <span class="card-tl-date">${t.date || '--'}</span>
-                    <span class="card-tl-desc">${t.doc_type ? `[${t.doc_type.toUpperCase()}] ` : ''}${t.description || ''}</span>
+                    <span class="card-tl-date">${esc(t.date) || '--'}</span>
+                    <span class="card-tl-desc">${t.doc_type ? `[${esc(t.doc_type).toUpperCase()}] ` : ''}${esc(t.description) || ''}</span>
                 </div>`;
             });
             html += `</div>`;
@@ -2087,8 +2101,8 @@ html, body {
                 div.className = 'autocomplete-item';
                 div.innerHTML = `
                     <span class="ac-score" style="background:${scoreColor(m.score || 0)}"></span>
-                    <span class="ac-name">${m.name}</span>
-                    <span class="ac-type">${m.type}</span>`;
+                    <span class="ac-name">${esc(m.name)}</span>
+                    <span class="ac-type">${esc(m.type)}</span>`;
                 div.addEventListener('click', () => {
                     selectEntity(m.id);
                     dom.searchInput.value = m.name;

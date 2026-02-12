@@ -8,7 +8,7 @@ import hashlib
 import shutil
 import yaml
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 
 DB_NAME = "epstein_analyzer.db"
 
@@ -78,7 +78,7 @@ class DatabaseManager:
         try:
             conn.execute(
                 "UPDATE disk_usage SET total_bytes = ?, measured_at = ? WHERE id = 1",
-                (total, datetime.utcnow().isoformat()),
+                (total, datetime.now(tz=timezone.utc).isoformat()),
             )
             conn.commit()
         finally:

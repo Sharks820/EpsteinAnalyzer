@@ -122,6 +122,7 @@ processor:
     financial_weight: 15
     location_weight: 10
     case_reference_weight: 10
+    codeword_weight: 25
     removed_file_weight: 50
     priority_threshold: 60
 
@@ -179,7 +180,7 @@ knowledge_graph:
 security:
   encryption:
     algorithm: "AES-256-GCM"
-    key_derivation: "argon2id"
+    key_derivation: "scrypt"
 
   integrity:
     check_on_startup: true

@@ -20,7 +20,7 @@ import sys
 import time
 import urllib.parse
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -81,6 +81,29 @@ ISLAND_AND_PROPERTY_KEYWORDS: List[str] = [
     "zorro ranch", "new mexico", "71st street", "9 east 71st",
     "el brillo way", "palm beach", "avenue foch", "paris apartment",
     "les wexner compound", "upper east side",
+]
+
+# Known codewords and euphemisms flagged for priority review.
+# Sources: court filings, investigative journalism, FBI FOIA releases.
+CODEWORD_TERMS: List[str] = [
+    # Food-related codewords
+    "pizza", "hot dog", "hotdog", "pasta", "cheese pizza", "walnut sauce",
+    "ice cream", "jerky", "grape soda", "sauce",
+    # Common euphemisms from case documents
+    "massage", "masseuse", "modeling", "talent scout", "recruiting",
+    "young model", "young woman", "young girl", "minor", "underage",
+    "schoolgirl", "high school", "middle school",
+    # Activity codewords
+    "party favor", "party favors", "special guest", "entertainment",
+    "arrangement", "appointment", "session", "package",
+    # Location/travel euphemisms
+    "the island", "the ranch", "down south", "overseas trip",
+    "private flight", "charter", "guest list",
+]
+
+# Pre-compiled regex for codeword matching (word-boundary aware)
+CODEWORD_PATTERNS: List[re.Pattern] = [
+    re.compile(r"\b" + re.escape(term) + r"\b", re.I) for term in CODEWORD_TERMS
 ]
 
 FINANCIAL_PATTERNS: List[re.Pattern] = [
@@ -703,7 +726,7 @@ class RedactionForensics:
             if hidden_words:
                 text = " ".join(hidden_words)
                 confidence = 0.95
-                log.info("Step 1 recovery: '%s' (conf=%.2f)", text[:80], confidence)
+                log.debug("Step 1 recovery: [%d chars] (conf=%.2f)", len(text), confidence)
                 return (text, confidence)
         except Exception as exc:
             log.debug("Step 1 error: %s", exc)
@@ -737,7 +760,8 @@ class RedactionForensics:
             for block in text_blocks:
                 # Look for Td/Tm positioning operators with coords in redaction range
                 positions = re.findall(r"([\d.]+)\s+([\d.]+)\s+Td", block)
-                texts = re.findall(r"\((.*?)\)\s*Tj", block)
+                # Handle escaped parens and hex strings in PDF text operators
+                texts = re.findall(r"\(([^)\\]*(?:\\.[^)\\]*)*)\)\s*Tj", block)
                 tj_arrays = re.findall(r"\[(.*?)\]\s*TJ", block, re.DOTALL)
 
                 for pos in positions:
@@ -752,11 +776,18 @@ class RedactionForensics:
                             for t in texts:
                                 extracted.append(t)
                             for arr in tj_arrays:
-                                parts = re.findall(r"\((.*?)\)", arr)
+                                # Extract both parenthesized strings and hex strings
+                                parts = re.findall(r"\(([^)\\]*(?:\\.[^)\\]*)*)\)", arr)
+                                hex_parts = re.findall(r"<([0-9A-Fa-f]+)>", arr)
                                 extracted.extend(parts)
+                                for hp in hex_parts:
+                                    try:
+                                        extracted.append(bytes.fromhex(hp).decode("latin-1"))
+                                    except (ValueError, UnicodeDecodeError):
+                                        pass
                             if extracted:
                                 result = "".join(extracted)
-                                log.info("Step 2 recovery: '%s'", result[:80])
+                                log.debug("Step 2 recovery: [%d chars]", len(result))
                                 return (result, 0.85)
                     except (ValueError, TypeError):
                         continue
@@ -791,7 +822,7 @@ class RedactionForensics:
                             if readable:
                                 combined = " ".join(readable)
                                 if len(combined.strip()) > 2:
-                                    log.info("Step 3 metadata recovery: '%s'", combined[:80])
+                                    log.debug("Step 3 metadata recovery: [%d chars]", len(combined))
                                     return (combined.strip(), 0.6)
                 except Exception:
                     continue
@@ -828,7 +859,7 @@ class RedactionForensics:
                                 spans_text.append(txt)
                     if spans_text:
                         result = " ".join(spans_text)
-                        log.info("Step 4 OCR mismatch recovery: '%s'", result[:80])
+                        log.debug("Step 4 OCR mismatch recovery: [%d chars]", len(result))
                         return (result, 0.9)
         except Exception as exc:
             log.debug("Step 4 error: %s", exc)
@@ -846,7 +877,7 @@ class RedactionForensics:
                 # Verify it's actual text, not just whitespace or garbage
                 alpha_ratio = sum(1 for c in cleaned if c.isalpha()) / max(len(cleaned), 1)
                 if alpha_ratio > 0.3 and len(cleaned) > 1:
-                    log.info("Step 5 copy-paste recovery: '%s'", cleaned[:80])
+                    log.debug("Step 5 copy-paste recovery: [%d chars]", len(cleaned))
                     return (cleaned, 0.88)
         except Exception as exc:
             log.debug("Step 5 error: %s", exc)
@@ -881,7 +912,7 @@ class RedactionForensics:
                                     chars.append(ch)
                             if chars:
                                 result = "".join(chars)
-                                log.info("Step 6 font analysis recovery: '%s'", result[:80])
+                                log.debug("Step 6 font analysis recovery: [%d chars]", len(result))
                                 return (result, 0.75)
 
             # Deep dive: parse xref objects for font CMap / ToUnicode mappings
@@ -948,6 +979,8 @@ class RedactionForensics:
             for search_text in search_parts:
                 # Escape FTS5 special characters
                 safe = search_text.replace('"', '""')
+                # Escape LIKE wildcard characters to prevent injection
+                safe = safe.replace("%", r"\%").replace("_", r"\_")
                 # Limit search length
                 if len(safe) > 40:
                     safe = safe[:40]
@@ -957,7 +990,7 @@ class RedactionForensics:
                         """SELECT dp.text_content, dp.document_id, dp.page_number
                            FROM document_pages dp
                            WHERE dp.document_id != ?
-                             AND dp.text_content LIKE ?
+                             AND dp.text_content LIKE ? ESCAPE '\'
                            LIMIT 5""",
                         (current_doc_id, f"%{safe}%"),
                     ).fetchall()
@@ -977,10 +1010,10 @@ class RedactionForensics:
                             start = idx_before + len(before_anchor)
                             recovered = other_text[start:idx_after].strip()
                             if recovered and len(recovered) > 0:
-                                log.info(
-                                    "Step 7 cross-doc recovery from doc %d: '%s'",
+                                log.debug(
+                                    "Step 7 cross-doc recovery from doc %d: [%d chars]",
                                     row["document_id"],
-                                    recovered[:80],
+                                    len(recovered),
                                 )
                                 return (recovered, 0.8)
         except Exception as exc:
@@ -1057,7 +1090,12 @@ class ImageForensics:
                         continue
 
                     img_bytes = base_image["image"]
-                    img_ext = base_image.get("ext", "png")
+                    raw_ext = base_image.get("ext", "png")
+                    # Sanitize extension: whitelist only safe image formats
+                    _ALLOWED_IMG_EXT = {"png", "jpg", "jpeg", "gif", "bmp", "tiff", "tif", "webp"}
+                    img_ext = raw_ext.lower().strip(".") if raw_ext else "png"
+                    if img_ext not in _ALLOWED_IMG_EXT:
+                        img_ext = "png"
                     file_hash = hashlib.sha256(img_bytes).hexdigest()
 
                     # Check for duplicate
@@ -1370,7 +1408,7 @@ class ImageForensics:
                         value = str(value)
                     exif_dict[tag_name] = value
         except Exception:
-            pass
+            logger.debug("EXIF extraction failed", exc_info=True)
         return exif_dict
 
 
@@ -1405,7 +1443,7 @@ class EmailChainStitcher:
                            SET has_gaps = 1, gap_details = ?,
                                analysis_completed = 0, updated_at = ?
                            WHERE id = ?""",
-                        (json.dumps(gaps), datetime.utcnow().isoformat(), chain_id),
+                        (json.dumps(gaps), datetime.now(tz=timezone.utc).isoformat(), chain_id),
                     )
                 conn.commit()
                 return {
@@ -1545,7 +1583,7 @@ class EmailChainStitcher:
                             if (first - timedelta(days=365)) <= fp_time <= (last + timedelta(days=365)):
                                 match_score += 1
                         except Exception:
-                            pass
+                            logger.debug("Time-range match failed", exc_info=True)
 
                 if match_score >= 2:
                     return {"chain_id": chain["id"], "match_type": "fuzzy", "score": match_score}
@@ -1670,7 +1708,7 @@ class EmailChainStitcher:
                 if chain_row and chain_row["participants"]:
                     all_participants = set(json.loads(chain_row["participants"]))
             except Exception:
-                pass
+                logger.debug("Failed to load chain participants", exc_info=True)
             if email_data.get("from_address"):
                 all_participants.add(email_data["from_address"].lower())
             for a in email_data.get("to", []):
@@ -1695,7 +1733,7 @@ class EmailChainStitcher:
                     json.dumps(sorted(all_participants)),
                     chain_id,
                     chain_id,
-                    datetime.utcnow().isoformat(),
+                    datetime.now(tz=timezone.utc).isoformat(),
                     chain_id,
                 ),
             )
@@ -2003,7 +2041,7 @@ class EntityExtractor:
                     # Increment document count
                     conn.execute(
                         "UPDATE entities SET document_count = document_count + 1, updated_at = ? WHERE id = ?",
-                        (datetime.utcnow().isoformat(), entity_id),
+                        (datetime.now(tz=timezone.utc).isoformat(), entity_id),
                     )
                 else:
                     # Generate external links
@@ -2155,13 +2193,27 @@ class PriorityScorer:
             if CASE_REF_PATTERN.search(full_text):
                 score += self.cfg.get("case_reference_weight", 10)
 
+            # --- Codeword / euphemism detection ---
+            codewords_found = []
+            for pat in CODEWORD_PATTERNS:
+                m = pat.search(full_text)
+                if m:
+                    codewords_found.append(m.group(0))
+            if codewords_found:
+                score += self.cfg.get("codeword_weight", 25)
+                log.info(
+                    "CODEWORD detected in doc_id=%d '%s': %s",
+                    document_id, doc["original_filename"],
+                    ", ".join(codewords_found[:10]),
+                )
+
             # Cap at 100
             score = min(score, 100)
 
             # Save score
             conn.execute(
                 "UPDATE documents SET priority_score = ?, updated_at = ? WHERE id = ?",
-                (score, datetime.utcnow().isoformat(), document_id),
+                (score, datetime.now(tz=timezone.utc).isoformat(), document_id),
             )
             conn.commit()
 
@@ -2254,7 +2306,7 @@ class ProcessorEngine:
             try:
                 conn.execute(
                     "UPDATE documents SET doc_type = ?, updated_at = ? WHERE id = ?",
-                    (doc_type, datetime.utcnow().isoformat(), document_id),
+                    (doc_type, datetime.now(tz=timezone.utc).isoformat(), document_id),
                 )
                 conn.commit()
             finally:
@@ -2341,7 +2393,7 @@ class ProcessorEngine:
                 """UPDATE documents
                    SET analysis_completed = 1, status = 'analyzed', updated_at = ?
                    WHERE id = ?""",
-                (datetime.utcnow().isoformat(), document_id),
+                (datetime.now(tz=timezone.utc).isoformat(), document_id),
             )
             conn.commit()
         finally:
@@ -2387,7 +2439,7 @@ class ProcessorEngine:
         try:
             conn.execute(
                 "UPDATE datasets SET status = 'processing', updated_at = ? WHERE id = ?",
-                (datetime.utcnow().isoformat(), dataset_id),
+                (datetime.now(tz=timezone.utc).isoformat(), dataset_id),
             )
             conn.commit()
         finally:
@@ -2418,7 +2470,7 @@ class ProcessorEngine:
                        processed_at = ?,
                        updated_at = ?
                    WHERE id = ?""",
-                (len(results), datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), dataset_id),
+                (len(results), datetime.now(tz=timezone.utc).isoformat(), datetime.now(tz=timezone.utc).isoformat(), dataset_id),
             )
             conn.commit()
         finally:

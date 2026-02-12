@@ -712,7 +712,7 @@ class GitHubMirror(SourceModule):
                                 "source": self.name,
                             })
                     except Exception:
-                        pass
+                        logger.debug("Skipped harvester item", exc_info=True)
         return items
 
     # ------------------------------------------------------------------

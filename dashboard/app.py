@@ -8,7 +8,7 @@ import json
 import os
 import sys
 import sqlite3
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from flask import (
@@ -36,18 +36,27 @@ from database.db import DatabaseManager  # noqa: E402
 # Flask application factory
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "local-dev-key-change-me"
+app.config["SECRET_KEY"] = os.environ.get(
+    "EPSTEIN_SECRET_KEY", os.urandom(32).hex()
+)
 socketio = SocketIO(app, async_mode="threading")
 
-# Initialize the database manager
-db = DatabaseManager(str(PROJECT_ROOT / "config" / "settings.yaml"))
-db.initialize()
+# Lazy-initialized database manager (avoids import-time side effects)
+_db: "DatabaseManager | None" = None
+
+
+def _get_db() -> "DatabaseManager":
+    global _db
+    if _db is None:
+        _db = DatabaseManager(str(PROJECT_ROOT / "config" / "settings.yaml"))
+        _db.initialize()
+    return _db
 
 # ---------------------------------------------------------------------------
 # Helper: get a fresh DB connection (with Row factory)
 # ---------------------------------------------------------------------------
 def get_conn() -> sqlite3.Connection:
-    return db.get_connection()
+    return _get_db().get_connection()
 
 
 def query_one(sql: str, params: tuple = ()):
@@ -84,6 +93,16 @@ def execute(sql: str, params: tuple = ()):
         conn.commit()
     finally:
         conn.close()
+
+
+def escape_like(s: str) -> str:
+    """Escape LIKE wildcard characters so user input is treated literally."""
+    return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def sanitize_fts(q: str) -> str:
+    """Wrap user input in double quotes to disable FTS5 operators."""
+    return '"' + q.replace('"', '""') + '"'
 
 
 def safe_json(val, default=None):
@@ -361,7 +380,7 @@ function apiGet(url){
 @app.context_processor
 def inject_sidebar_data():
     try:
-        stats = db.get_stats()
+        stats = _get_db().get_stats()
     except Exception:
         stats = {}
     return {
@@ -575,8 +594,8 @@ function loadNextDataset(){
 
 @app.route("/")
 def command_center():
-    stats = db.get_stats()
-    datasets_raw = db.get_dataset_status()
+    stats = _get_db().get_stats()
+    datasets_raw = _get_db().get_dataset_status()
     # Add CSS class for dataset buttons
     datasets = []
     for ds in datasets_raw:
@@ -975,8 +994,11 @@ def entities_list():
     conditions = []
     params = []
     if q:
-        conditions.append("(e.name LIKE ? OR e.canonical_name LIKE ? OR e.aliases LIKE ? OR e.role LIKE ?)")
-        like = f"%{q}%"
+        conditions.append(
+            r"(e.name LIKE ? ESCAPE '\' OR e.canonical_name LIKE ? ESCAPE '\'"
+            r" OR e.aliases LIKE ? ESCAPE '\' OR e.role LIKE ? ESCAPE '\')"
+        )
+        like = f"%{escape_like(q)}%"
         params.extend([like, like, like, like])
     if filter_type:
         conditions.append("e.entity_type = ?")
@@ -1429,8 +1451,8 @@ def chains_list():
     conditions = []
     params = []
     if q:
-        conditions.append("(normalized_subject LIKE ? OR participants LIKE ?)")
-        like = f"%{q}%"
+        conditions.append(r"(normalized_subject LIKE ? ESCAPE '\' OR participants LIKE ? ESCAPE '\')")
+        like = f"%{escape_like(q)}%"
         params.extend([like, like])
     if filter_gaps:
         conditions.append("has_gaps = 1")
@@ -1641,7 +1663,7 @@ def findings_create():
             request.form.get("confidence_level", "unverified"),
         ),
     )
-    db.log_action("create_finding", f"Created finding: {title}")
+    _get_db().log_action("create_finding", f"Created finding: {title}")
     return redirect(url_for("findings_board"))
 
 
@@ -1752,9 +1774,9 @@ def image_decide(image_id):
 
     execute(
         "UPDATE images SET user_reviewed = 1, user_decision = ?, updated_at = ? WHERE id = ?",
-        (decision, datetime.utcnow().isoformat(), image_id),
+        (decision, datetime.now(tz=timezone.utc).isoformat(), image_id),
     )
-    db.log_action("image_review", f"Image {image_id} decision: {decision}")
+    _get_db().log_action("image_review", f"Image {image_id} decision: {decision}")
     return redirect(url_for("image_review"))
 
 
@@ -1843,13 +1865,13 @@ def deletion_decide(item_id):
     decision = request.form.get("decision", "keep")
     execute(
         "UPDATE deletion_queue SET user_decision = ?, decided_at = ? WHERE id = ?",
-        (decision, datetime.utcnow().isoformat(), item_id),
+        (decision, datetime.now(tz=timezone.utc).isoformat(), item_id),
     )
     if decision == "delete":
         row = query_one("SELECT document_id FROM deletion_queue WHERE id = ?", (item_id,))
         if row:
             execute("UPDATE documents SET status = 'deleted' WHERE id = ?", (row["document_id"],))
-    db.log_action("deletion_decision", f"Item {item_id}: {decision}")
+    _get_db().log_action("deletion_decision", f"Item {item_id}: {decision}")
     return redirect(url_for("deletions_queue"))
 
 
@@ -1998,7 +2020,7 @@ def export_report():
 
     report_findings = query_all(f"SELECT * FROM findings WHERE {where} ORDER BY category, created_at DESC")
 
-    lines = ["# EpsteinAnalyzer Investigation Report", f"Generated: {datetime.utcnow().isoformat()}", ""]
+    lines = ["# EpsteinAnalyzer Investigation Report", f"Generated: {datetime.now(tz=timezone.utc).isoformat()}", ""]
     current_cat = None
     for f in report_findings:
         if f["category"] != current_cat:
@@ -2030,7 +2052,7 @@ def export_public():
         "table{width:100%;border-collapse:collapse}th,td{padding:8px;border-bottom:1px solid #333;text-align:left}",
         "th{color:#888;font-size:.85rem}h1{color:#58a6ff}</style></head><body>",
         "<h1>EpsteinAnalyzer - Public Entity Report</h1>",
-        f"<p style='color:#888'>Entities with implication score >= {min_score} | Generated {datetime.utcnow().strftime('%Y-%m-%d')}</p>",
+        f"<p style='color:#888'>Entities with implication score >= {min_score} | Generated {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d')}</p>",
         "<table><thead><tr><th>Name</th><th>Type</th><th>Score</th><th>Evidence Count</th></tr></thead><tbody>",
     ]
     for e in entities:
@@ -2131,10 +2153,10 @@ SETTINGS_HTML = r"""{% extends "base.html" %}
 
 @app.route("/settings")
 def settings_page():
-    disk = db.check_disk_usage()
+    disk = _get_db().check_disk_usage()
     db_size = 0
-    if db.db_path.exists():
-        db_size = round(db.db_path.stat().st_size / (1024 ** 2), 2)
+    if _get_db().db_path.exists():
+        db_size = round(_get_db().db_path.stat().st_size / (1024 ** 2), 2)
 
     audit_logs = query_all("SELECT * FROM audit_log ORDER BY created_at DESC LIMIT 50")
 
@@ -2142,10 +2164,10 @@ def settings_page():
         SETTINGS_HTML,
         active="settings",
         disk=disk,
-        db_path=str(db.db_path),
-        data_dir=str(db.data_dir),
+        db_path=str(_get_db().db_path),
+        data_dir=str(_get_db().data_dir),
         db_size_mb=db_size,
-        config=db.config,
+        config=_get_db().config,
         audit_logs=audit_logs,
     )
 
@@ -2156,8 +2178,8 @@ def settings_page():
 
 @app.route("/api/stats")
 def api_stats():
-    stats = db.get_stats()
-    datasets = db.get_dataset_status()
+    stats = _get_db().get_stats()
+    datasets = _get_db().get_dataset_status()
     stats["datasets"] = datasets
     return jsonify(stats)
 
@@ -2176,7 +2198,7 @@ def api_dataset_load(n):
         if existing:
             conn.execute(
                 "UPDATE datasets SET status = 'downloading', updated_at = ? WHERE dataset_number = ?",
-                (datetime.utcnow().isoformat(), n),
+                (datetime.now(tz=timezone.utc).isoformat(), n),
             )
         else:
             conn.execute(
@@ -2187,7 +2209,7 @@ def api_dataset_load(n):
     finally:
         conn.close()
 
-    db.log_action("dataset_load", f"Started loading dataset {n}")
+    _get_db().log_action("dataset_load", f"Started loading dataset {n}")
     socketio.emit("progress", {"message": f"Dataset {n} download started...", "level": "info"})
     socketio.emit("dataset_progress", {"dataset": n, "percent": 0, "message": f"Initializing dataset {n}..."})
 
@@ -2209,7 +2231,7 @@ def api_dataset_load(n):
         try:
             conn2.execute(
                 "UPDATE datasets SET status = 'downloaded', downloaded_at = ?, updated_at = ? WHERE dataset_number = ?",
-                (datetime.utcnow().isoformat(), datetime.utcnow().isoformat(), n),
+                (datetime.now(tz=timezone.utc).isoformat(), datetime.now(tz=timezone.utc).isoformat(), n),
             )
             conn2.commit()
         finally:
@@ -2226,19 +2248,19 @@ def api_dataset_process(n):
     try:
         conn.execute(
             "UPDATE datasets SET status = 'processing', updated_at = ? WHERE dataset_number = ?",
-            (datetime.utcnow().isoformat(), n),
+            (datetime.now(tz=timezone.utc).isoformat(), n),
         )
         conn.commit()
     finally:
         conn.close()
-    db.log_action("dataset_process", f"Started processing dataset {n}")
+    _get_db().log_action("dataset_process", f"Started processing dataset {n}")
     socketio.emit("progress", {"message": f"Processing dataset {n}...", "level": "info"})
     return jsonify({"status": "processing", "dataset": n})
 
 
 @app.route("/api/dataset/<int:n>/analyze", methods=["POST"])
 def api_dataset_analyze(n):
-    db.log_action("dataset_analyze", f"Started AI analysis on dataset {n}")
+    _get_db().log_action("dataset_analyze", f"Started AI analysis on dataset {n}")
     socketio.emit("progress", {"message": f"AI analysis started for dataset {n}...", "level": "info"})
     return jsonify({"status": "analyzing", "dataset": n})
 
@@ -2256,16 +2278,16 @@ def api_search():
                JOIN document_pages dp ON dp.id = document_text_fts.rowid
                WHERE document_text_fts MATCH ?
                LIMIT 50""",
-            (q,),
+            (sanitize_fts(q),),
         )
     except Exception:
         # FTS might not be populated; fall back to LIKE
         results = query_all(
-            """SELECT document_id, page_number, substr(text_content, 1, 200) as snippet
+            r"""SELECT document_id, page_number, substr(text_content, 1, 200) as snippet
                FROM document_pages
-               WHERE text_content LIKE ?
+               WHERE text_content LIKE ? ESCAPE '\'
                LIMIT 50""",
-            (f"%{q}%",),
+            (f"%{escape_like(q)}%",),
         )
     return jsonify({"query": q, "results": results})
 
@@ -2285,8 +2307,8 @@ def api_entity_evidence(entity_id):
 
 @app.route("/api/compact", methods=["POST"])
 def api_compact():
-    result = db.auto_compact()
-    db.log_action("auto_compact", json.dumps(result))
+    result = _get_db().auto_compact()
+    _get_db().log_action("auto_compact", json.dumps(result))
     socketio.emit("progress", {"message": f"Compact complete: freed {result['freed_mb']} MB", "level": "success"})
     return jsonify(result)
 
@@ -2298,8 +2320,8 @@ def api_document_flag(doc_id):
         return jsonify({"error": "Not found"}), 404
     new_flag = 0 if doc["user_flagged"] else 1
     execute("UPDATE documents SET user_flagged = ?, updated_at = ? WHERE id = ?",
-            (new_flag, datetime.utcnow().isoformat(), doc_id))
-    db.log_action("document_flag", f"Document {doc_id} flagged={new_flag}")
+            (new_flag, datetime.now(tz=timezone.utc).isoformat(), doc_id))
+    _get_db().log_action("document_flag", f"Document {doc_id} flagged={new_flag}")
     return jsonify({"flagged": bool(new_flag)})
 
 
