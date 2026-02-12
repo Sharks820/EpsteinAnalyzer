@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -226,12 +227,12 @@ class ModelRunner(ABC):
     def check_available(self) -> bool:
         """Test whether the CLI tool responds at all."""
         try:
+            cmd = shutil.which(self.cli_command) or self.cli_command
             result = subprocess.run(
-                [self.cli_command, "--help"],
+                [cmd, "--help"],
                 capture_output=True,
                 text=True,
                 timeout=15,
-                shell=(os.name == "nt"),
             )
             return result.returncode in (0, 1, 2)  # --help may exit 1 or 2
         except FileNotFoundError:

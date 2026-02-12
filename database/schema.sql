@@ -74,6 +74,22 @@ CREATE TABLE IF NOT EXISTS document_pages (
     UNIQUE(document_id, page_number)
 );
 
+-- FTS sync triggers for document_text_fts
+CREATE TRIGGER IF NOT EXISTS document_pages_ai AFTER INSERT ON document_pages BEGIN
+    INSERT INTO document_text_fts(rowid, document_id, page_number, text_content)
+    VALUES (new.id, new.document_id, new.page_number, new.text_content);
+END;
+CREATE TRIGGER IF NOT EXISTS document_pages_ad AFTER DELETE ON document_pages BEGIN
+    INSERT INTO document_text_fts(document_text_fts, rowid, document_id, page_number, text_content)
+    VALUES ('delete', old.id, old.document_id, old.page_number, old.text_content);
+END;
+CREATE TRIGGER IF NOT EXISTS document_pages_au AFTER UPDATE ON document_pages BEGIN
+    INSERT INTO document_text_fts(document_text_fts, rowid, document_id, page_number, text_content)
+    VALUES ('delete', old.id, old.document_id, old.page_number, old.text_content);
+    INSERT INTO document_text_fts(rowid, document_id, page_number, text_content)
+    VALUES (new.id, new.document_id, new.page_number, new.text_content);
+END;
+
 CREATE INDEX idx_doc_pages_doc ON document_pages(document_id);
 
 -- ================================================
@@ -194,6 +210,22 @@ CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
     content='entities',
     content_rowid='id'
 );
+
+-- FTS sync triggers for entities_fts
+CREATE TRIGGER IF NOT EXISTS entities_ai AFTER INSERT ON entities BEGIN
+    INSERT INTO entities_fts(rowid, name, canonical_name, aliases, description, role)
+    VALUES (new.id, new.name, new.canonical_name, new.aliases, new.description, new.role);
+END;
+CREATE TRIGGER IF NOT EXISTS entities_ad AFTER DELETE ON entities BEGIN
+    INSERT INTO entities_fts(entities_fts, rowid, name, canonical_name, aliases, description, role)
+    VALUES ('delete', old.id, old.name, old.canonical_name, old.aliases, old.description, old.role);
+END;
+CREATE TRIGGER IF NOT EXISTS entities_au AFTER UPDATE ON entities BEGIN
+    INSERT INTO entities_fts(entities_fts, rowid, name, canonical_name, aliases, description, role)
+    VALUES ('delete', old.id, old.name, old.canonical_name, old.aliases, old.description, old.role);
+    INSERT INTO entities_fts(rowid, name, canonical_name, aliases, description, role)
+    VALUES (new.id, new.name, new.canonical_name, new.aliases, new.description, new.role);
+END;
 
 -- ================================================
 -- RELATIONSHIPS (Knowledge Graph Edges)

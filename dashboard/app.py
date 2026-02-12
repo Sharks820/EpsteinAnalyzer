@@ -729,7 +729,7 @@ DOCUMENT_VIEWER_HTML = r"""{% extends "base.html" %}
       {% for ann in annotations %}
       <div class="annotation">
         <div class="an-label">Page {{ ann.page }} &middot; Para {{ ann.para }}</div>
-        <div>{{ ann.html|e }}</div>
+        <div>{{ ann.html|safe }}</div>
       </div>
       {% endfor %}
       {% endif %}
@@ -1797,10 +1797,18 @@ def image_decide(image_id):
 
 @app.route("/serve_image/<int:image_id>")
 def serve_image(image_id):
-    image = query_one("SELECT file_path, quarantined FROM images WHERE id = ?", (image_id,))
-    if not image or not image.get("file_path") or image.get("quarantined"):
+    image = query_one(
+        "SELECT file_path, quarantined, minor_detected FROM images WHERE id = ?",
+        (image_id,),
+    )
+    if not image or not image.get("file_path"):
         abort(404)
-    fp = Path(image["file_path"])
+    if image.get("quarantined") or image.get("minor_detected"):
+        abort(403)
+    fp = Path(image["file_path"]).resolve()
+    data_dir = (PROJECT_ROOT / "data").resolve()
+    if not fp.is_relative_to(data_dir):
+        abort(403)
     if not fp.exists():
         abort(404)
     return send_from_directory(str(fp.parent), fp.name)
