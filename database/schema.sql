@@ -47,11 +47,11 @@ CREATE TABLE IF NOT EXISTS documents (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_documents_dataset ON documents(dataset_id);
-CREATE INDEX idx_documents_priority ON documents(priority_score DESC);
-CREATE INDEX idx_documents_status ON documents(status);
-CREATE INDEX idx_documents_removed ON documents(is_removed_from_source);
-CREATE INDEX idx_documents_doc_type ON documents(doc_type);
+CREATE INDEX IF NOT EXISTS idx_documents_dataset ON documents(dataset_id);
+CREATE INDEX IF NOT EXISTS idx_documents_priority ON documents(priority_score DESC);
+CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
+CREATE INDEX IF NOT EXISTS idx_documents_removed ON documents(is_removed_from_source);
+CREATE INDEX IF NOT EXISTS idx_documents_doc_type ON documents(doc_type);
 
 -- Full-text search on extracted text
 CREATE VIRTUAL TABLE IF NOT EXISTS document_text_fts USING fts5(
@@ -90,7 +90,7 @@ CREATE TRIGGER IF NOT EXISTS document_pages_au AFTER UPDATE ON document_pages BE
     VALUES (new.id, new.document_id, new.page_number, new.text_content);
 END;
 
-CREATE INDEX idx_doc_pages_doc ON document_pages(document_id);
+CREATE INDEX IF NOT EXISTS idx_doc_pages_doc ON document_pages(document_id);
 
 -- ================================================
 -- REDACTIONS
@@ -121,9 +121,9 @@ CREATE TABLE IF NOT EXISTS redactions (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_redactions_doc ON redactions(document_id);
-CREATE INDEX idx_redactions_status ON redactions(status);
-CREATE INDEX idx_redactions_recovered ON redactions(is_recovered);
+CREATE INDEX IF NOT EXISTS idx_redactions_doc ON redactions(document_id);
+CREATE INDEX IF NOT EXISTS idx_redactions_status ON redactions(status);
+CREATE INDEX IF NOT EXISTS idx_redactions_recovered ON redactions(is_recovered);
 
 -- ================================================
 -- IMAGE EVIDENCE
@@ -155,9 +155,9 @@ CREATE TABLE IF NOT EXISTS images (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_images_doc ON images(document_id);
-CREATE INDEX idx_images_quarantined ON images(quarantined);
-CREATE INDEX idx_images_reviewed ON images(user_reviewed);
+CREATE INDEX IF NOT EXISTS idx_images_doc ON images(document_id);
+CREATE INDEX IF NOT EXISTS idx_images_quarantined ON images(quarantined);
+CREATE INDEX IF NOT EXISTS idx_images_reviewed ON images(user_reviewed);
 
 -- ================================================
 -- ENTITIES (Knowledge Graph Nodes)
@@ -195,10 +195,10 @@ CREATE TABLE IF NOT EXISTS entities (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE UNIQUE INDEX idx_entities_canonical ON entities(canonical_name, entity_type);
-CREATE INDEX idx_entities_type ON entities(entity_type);
-CREATE INDEX idx_entities_score ON entities(implication_score DESC);
-CREATE INDEX idx_entities_name ON entities(name);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_entities_canonical ON entities(canonical_name, entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_type ON entities(entity_type);
+CREATE INDEX IF NOT EXISTS idx_entities_score ON entities(implication_score DESC);
+CREATE INDEX IF NOT EXISTS idx_entities_name ON entities(name);
 
 -- Full-text search on entities
 CREATE VIRTUAL TABLE IF NOT EXISTS entities_fts USING fts5(
@@ -252,10 +252,10 @@ CREATE TABLE IF NOT EXISTS relationships (
     UNIQUE(source_entity_id, target_entity_id, relationship_type)
 );
 
-CREATE INDEX idx_rel_source ON relationships(source_entity_id);
-CREATE INDEX idx_rel_target ON relationships(target_entity_id);
-CREATE INDEX idx_rel_type ON relationships(relationship_type);
-CREATE INDEX idx_rel_weight ON relationships(weight DESC);
+CREATE INDEX IF NOT EXISTS idx_rel_source ON relationships(source_entity_id);
+CREATE INDEX IF NOT EXISTS idx_rel_target ON relationships(target_entity_id);
+CREATE INDEX IF NOT EXISTS idx_rel_type ON relationships(relationship_type);
+CREATE INDEX IF NOT EXISTS idx_rel_weight ON relationships(weight DESC);
 
 -- ================================================
 -- ENTITY-DOCUMENT ASSOCIATIONS
@@ -283,10 +283,10 @@ CREATE TABLE IF NOT EXISTS entity_document_links (
     UNIQUE(entity_id, document_id, page_number, mention_type)
 );
 
-CREATE INDEX idx_edl_entity ON entity_document_links(entity_id);
-CREATE INDEX idx_edl_document ON entity_document_links(document_id);
-CREATE INDEX idx_edl_score ON entity_document_links(damning_score DESC);
-CREATE INDEX idx_edl_pinned ON entity_document_links(user_pinned);
+CREATE INDEX IF NOT EXISTS idx_edl_entity ON entity_document_links(entity_id);
+CREATE INDEX IF NOT EXISTS idx_edl_document ON entity_document_links(document_id);
+CREATE INDEX IF NOT EXISTS idx_edl_score ON entity_document_links(damning_score DESC);
+CREATE INDEX IF NOT EXISTS idx_edl_pinned ON entity_document_links(user_pinned);
 
 -- ================================================
 -- EMAIL CHAINS
@@ -312,8 +312,8 @@ CREATE TABLE IF NOT EXISTS email_chains (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_chains_subject ON email_chains(normalized_subject);
-CREATE INDEX idx_chains_priority ON email_chains(priority_score DESC);
+CREATE INDEX IF NOT EXISTS idx_chains_subject ON email_chains(normalized_subject);
+CREATE INDEX IF NOT EXISTS idx_chains_priority ON email_chains(priority_score DESC);
 
 CREATE TABLE IF NOT EXISTS email_messages (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -335,9 +335,9 @@ CREATE TABLE IF NOT EXISTS email_messages (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_emails_chain ON email_messages(chain_id);
-CREATE INDEX idx_emails_doc ON email_messages(document_id);
-CREATE INDEX idx_emails_date ON email_messages(email_date);
+CREATE INDEX IF NOT EXISTS idx_emails_chain ON email_messages(chain_id);
+CREATE INDEX IF NOT EXISTS idx_emails_doc ON email_messages(document_id);
+CREATE INDEX IF NOT EXISTS idx_emails_date ON email_messages(email_date);
 
 -- ================================================
 -- FINDINGS BOARD
@@ -365,8 +365,8 @@ CREATE TABLE IF NOT EXISTS findings (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_findings_category ON findings(category);
-CREATE INDEX idx_findings_confidence ON findings(confidence_level);
+CREATE INDEX IF NOT EXISTS idx_findings_category ON findings(category);
+CREATE INDEX IF NOT EXISTS idx_findings_confidence ON findings(confidence_level);
 
 -- ================================================
 -- DELETION QUEUE
@@ -384,7 +384,7 @@ CREATE TABLE IF NOT EXISTS deletion_queue (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_deletion_pending ON deletion_queue(user_decision);
+CREATE INDEX IF NOT EXISTS idx_deletion_pending ON deletion_queue(user_decision);
 
 -- ================================================
 -- AI ANALYSIS RESULTS
@@ -393,7 +393,7 @@ CREATE INDEX idx_deletion_pending ON deletion_queue(user_decision);
 CREATE TABLE IF NOT EXISTS ai_analyses (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     document_id INTEGER NOT NULL REFERENCES documents(id),
-    model_name TEXT NOT NULL CHECK(model_name IN ('codex', 'gemini', 'claude')),
+    model_name TEXT NOT NULL CHECK(model_name IN ('codex', 'gemini', 'claude', 'kimi')),
     -- Analysis results (JSON)
     summary TEXT,
     entities_found TEXT,  -- JSON array
@@ -410,8 +410,8 @@ CREATE TABLE IF NOT EXISTS ai_analyses (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_ai_doc ON ai_analyses(document_id);
-CREATE INDEX idx_ai_model ON ai_analyses(model_name);
+CREATE INDEX IF NOT EXISTS idx_ai_doc ON ai_analyses(document_id);
+CREATE INDEX IF NOT EXISTS idx_ai_model ON ai_analyses(model_name);
 
 CREATE TABLE IF NOT EXISTS ai_consensus (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -429,8 +429,8 @@ CREATE TABLE IF NOT EXISTS ai_consensus (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_consensus_doc ON ai_consensus(document_id);
-CREATE INDEX idx_consensus_review ON ai_consensus(needs_user_review);
+CREATE INDEX IF NOT EXISTS idx_consensus_doc ON ai_consensus(document_id);
+CREATE INDEX IF NOT EXISTS idx_consensus_review ON ai_consensus(needs_user_review);
 
 -- ================================================
 -- SECURITY & INTEGRITY
@@ -448,7 +448,7 @@ CREATE TABLE IF NOT EXISTS file_integrity (
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_integrity_tamper ON file_integrity(tamper_detected);
+CREATE INDEX IF NOT EXISTS idx_integrity_tamper ON file_integrity(tamper_detected);
 
 CREATE TABLE IF NOT EXISTS audit_log (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -495,6 +495,6 @@ CREATE TABLE IF NOT EXISTS removed_files (
     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
 );
 
-CREATE INDEX idx_removed_recovered ON removed_files(recovered);
-CREATE INDEX idx_removed_priority ON removed_files(priority);
-CREATE INDEX idx_removed_url ON removed_files(original_url);
+CREATE INDEX IF NOT EXISTS idx_removed_recovered ON removed_files(recovered);
+CREATE INDEX IF NOT EXISTS idx_removed_priority ON removed_files(priority);
+CREATE INDEX IF NOT EXISTS idx_removed_url ON removed_files(original_url);
