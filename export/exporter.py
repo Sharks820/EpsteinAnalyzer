@@ -1523,7 +1523,7 @@ class ImageRedactionExporter:
             # Fetch images that have been flagged
             rows = conn.execute(
                 """SELECT i.id, i.file_path, i.document_id, i.page_number,
-                          i.contains_faces, i.contains_minors_flag,
+                          i.minor_detected,
                           i.user_reviewed, i.quarantined
                    FROM images i
                    WHERE i.recovery_successful = 1"""
@@ -1545,13 +1545,13 @@ class ImageRedactionExporter:
             needs_quarantine = False
             reason = ""
 
-            if row["contains_minors_flag"]:
+            if row["minor_detected"]:
                 needs_quarantine = True
                 reason = "Flagged as potentially containing minors (auto-detection)"
-            elif self.auto_quarantine_minors and row["contains_faces"] and not row["user_reviewed"]:
-                # If it has faces and has not been reviewed, quarantine out of caution
+            elif self.auto_quarantine_minors and not row["user_reviewed"]:
+                # If not reviewed yet and auto-quarantine is enabled, quarantine for safety
                 needs_quarantine = True
-                reason = "Contains faces, not yet reviewed -- quarantined for safety"
+                reason = "Not yet reviewed -- quarantined for safety"
 
             if needs_quarantine:
                 success = self._quarantine_image(image_id, file_path, reason)
@@ -1591,23 +1591,24 @@ class ImageRedactionExporter:
             return False
 
         conn = self.db.get_connection()
+        db_success = False
         try:
             conn.execute(
-                """UPDATE images SET quarantined = 1, quarantine_reason = ?,
-                   quarantine_path = ?, updated_at = ?
+                """UPDATE images SET quarantined = 1, updated_at = ?
                    WHERE id = ?""",
-                (reason, str(dest), _now_iso(), image_id),
+                (_now_iso(), image_id),
             )
             conn.commit()
-        except sqlite3.OperationalError:
-            # If quarantine columns do not exist, log and continue
-            logger.warning(
-                "Could not update quarantine columns for image %d "
-                "(columns may not exist in schema).", image_id,
+            db_success = True
+        except sqlite3.OperationalError as exc:
+            logger.error(
+                "Failed to mark image %d as quarantined in DB: %s", image_id, exc,
             )
         finally:
             conn.close()
 
+        if not db_success:
+            return False
         logger.info("Image %d quarantined: %s", image_id, reason)
         return True
 
@@ -1635,12 +1636,12 @@ class ImageRedactionExporter:
 
             # Fetch associated redaction regions
             redaction_rows = conn.execute(
-                """SELECT r.bbox_x, r.bbox_y, r.bbox_width, r.bbox_height
+                """SELECT r.position_x, r.position_y, r.width, r.height
                    FROM redactions r
                    JOIN images i ON i.document_id = r.document_id
                                 AND i.page_number = r.page_number
                    WHERE i.id = ?
-                     AND r.bbox_x IS NOT NULL""",
+                     AND r.position_x IS NOT NULL""",
                 (image_id,),
             ).fetchall()
         finally:
@@ -1652,10 +1653,10 @@ class ImageRedactionExporter:
 
         regions = [
             {
-                "x": r["bbox_x"],
-                "y": r["bbox_y"],
-                "width": r["bbox_width"],
-                "height": r["bbox_height"],
+                "x": r["position_x"],
+                "y": r["position_y"],
+                "width": r["width"],
+                "height": r["height"],
             }
             for r in redaction_rows
         ]
