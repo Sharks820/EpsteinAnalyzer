@@ -289,15 +289,24 @@ class BackupManager:
                     last_backup_file.read_text().strip()
                 )
 
+        # Resolve backup_dir to skip it during traversal (prevents recursive backup)
+        backup_dir_resolved = backup_dir.resolve()
+
         for file_path in self.data_dir.rglob("*"):
             if not file_path.is_file():
                 continue
             if "temp" in str(file_path):
                 continue  # Skip temp files
+            # Skip files inside the backup destination
+            try:
+                if file_path.resolve().is_relative_to(backup_dir_resolved):
+                    continue
+            except (OSError, ValueError):
+                pass
 
             # Incremental: only back up files modified since last backup
             if incremental and last_backup_time:
-                mod_time = datetime.fromtimestamp(file_path.stat().st_mtime)
+                mod_time = datetime.utcfromtimestamp(file_path.stat().st_mtime)
                 if mod_time < last_backup_time:
                     continue
 
@@ -310,15 +319,6 @@ class BackupManager:
             self.encryption.encrypt_file(str(file_path), password, str(dest) + ".enc")
             files_backed_up += 1
             total_size += file_path.stat().st_size
-
-        # Also backup the database
-        db_path = self.data_dir / "epstein_analyzer.db"
-        if db_path.exists():
-            self.encryption.encrypt_file(
-                str(db_path), password, str(backup_dir / "epstein_analyzer.db.enc")
-            )
-            files_backed_up += 1
-            total_size += db_path.stat().st_size
 
         # Update last backup timestamp
         last_backup_file = backup_path / ".last_backup"

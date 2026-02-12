@@ -1,0 +1,2356 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>EpsteinAnalyzer - Evidence Board</title>
+<!--
+  EpsteinAnalyzer Public Viewer - Evidence Board
+  ================================================
+  Self-contained interactive visualization of the Epstein case knowledge graph.
+  All data sourced from publicly released DOJ documents, court filings, and FOIA disclosures.
+
+  Data Loading:
+    Expects data files at relative paths:
+      data/graph.json      - Nodes (entities) and links (relationships)
+      data/timeline.json   - Chronological events
+      data/entities/<id>.json - Individual entity cards
+
+  JSON schemas are documented in export/exporter.py (PublicViewerExporter class).
+
+  Dependencies (loaded from CDN):
+    - D3.js v7 (d3js.org) for 2D force-directed graph
+    - Three.js (unpkg.com) for optional 3D view
+-->
+
+<!-- D3.js v7 from official CDN -->
+<script src="https://d3js.org/d3.v7.min.js"></script>
+<!-- Three.js from unpkg CDN -->
+<script src="https://unpkg.com/three@0.160.0/build/three.min.js"></script>
+<script src="https://unpkg.com/three@0.160.0/examples/js/controls/OrbitControls.js"></script>
+
+<style>
+/* ================================================================
+   CSS Reset & Variables
+   ================================================================ */
+*, *::before, *::after {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+:root {
+    /* Dark theme (default) */
+    --bg-primary: #0a0e17;
+    --bg-secondary: #111827;
+    --bg-tertiary: #1f2937;
+    --bg-card: #1a1f2e;
+    --text-primary: #e5e7eb;
+    --text-secondary: #9ca3af;
+    --text-muted: #6b7280;
+    --accent: #3b82f6;
+    --accent-hover: #2563eb;
+    --border: #374151;
+    --border-light: #4b5563;
+    --danger: #e63946;
+    --warning: #f4a261;
+    --caution: #e9c46a;
+    --safe: #2a9d8f;
+    --score-high: #e63946;
+    --score-medium: #f4a261;
+    --score-low: #e9c46a;
+    --score-minimal: #6b7280;
+    --shadow: rgba(0, 0, 0, 0.5);
+    --panel-width: 420px;
+    --toolbar-height: 56px;
+    --transition-speed: 0.25s;
+    --font-mono: 'Cascadia Code', 'Fira Code', 'JetBrains Mono', 'Consolas', monospace;
+    --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+}
+
+:root.light-theme {
+    --bg-primary: #f3f4f6;
+    --bg-secondary: #ffffff;
+    --bg-tertiary: #e5e7eb;
+    --bg-card: #ffffff;
+    --text-primary: #111827;
+    --text-secondary: #4b5563;
+    --text-muted: #9ca3af;
+    --border: #d1d5db;
+    --border-light: #e5e7eb;
+    --shadow: rgba(0, 0, 0, 0.1);
+}
+
+/* ================================================================
+   Base Layout
+   ================================================================ */
+html, body {
+    width: 100%;
+    height: 100%;
+    overflow: hidden;
+    font-family: var(--font-sans);
+    background: var(--bg-primary);
+    color: var(--text-primary);
+}
+
+#app {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    height: 100%;
+}
+
+/* ================================================================
+   Toolbar
+   ================================================================ */
+#toolbar {
+    display: flex;
+    align-items: center;
+    height: var(--toolbar-height);
+    padding: 0 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    gap: 12px;
+    flex-shrink: 0;
+    z-index: 100;
+}
+
+#toolbar .brand {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 700;
+    font-size: 16px;
+    color: var(--accent);
+    white-space: nowrap;
+    user-select: none;
+}
+
+#toolbar .brand .brand-icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 6px;
+    background: var(--accent);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #fff;
+    font-size: 16px;
+    font-weight: 800;
+}
+
+/* Search bar */
+#search-container {
+    position: relative;
+    flex: 1;
+    max-width: 400px;
+}
+
+#search-input {
+    width: 100%;
+    height: 36px;
+    padding: 0 36px 0 12px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 14px;
+    outline: none;
+    transition: border-color var(--transition-speed);
+}
+
+#search-input:focus {
+    border-color: var(--accent);
+}
+
+#search-input::placeholder {
+    color: var(--text-muted);
+}
+
+#search-clear {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    transform: translateY(-50%);
+    background: none;
+    border: none;
+    color: var(--text-muted);
+    cursor: pointer;
+    font-size: 18px;
+    display: none;
+    line-height: 1;
+}
+
+#search-clear.visible {
+    display: block;
+}
+
+#autocomplete-list {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    right: 0;
+    max-height: 300px;
+    overflow-y: auto;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 0 0 8px 8px;
+    z-index: 200;
+    display: none;
+    box-shadow: 0 8px 24px var(--shadow);
+}
+
+#autocomplete-list.visible {
+    display: block;
+}
+
+.autocomplete-item {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    cursor: pointer;
+    gap: 8px;
+    transition: background var(--transition-speed);
+}
+
+.autocomplete-item:hover,
+.autocomplete-item.active {
+    background: var(--bg-tertiary);
+}
+
+.autocomplete-item .ac-score {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.autocomplete-item .ac-name {
+    font-size: 14px;
+    font-weight: 500;
+    flex: 1;
+}
+
+.autocomplete-item .ac-type {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+}
+
+/* Toolbar buttons */
+.toolbar-btn {
+    height: 36px;
+    padding: 0 14px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 13px;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    white-space: nowrap;
+    transition: all var(--transition-speed);
+    user-select: none;
+}
+
+.toolbar-btn:hover {
+    background: var(--border);
+}
+
+.toolbar-btn.active {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+}
+
+.toolbar-sep {
+    width: 1px;
+    height: 24px;
+    background: var(--border);
+    flex-shrink: 0;
+}
+
+/* View mode toggle */
+#view-mode-group {
+    display: flex;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+#view-mode-group .view-btn {
+    height: 34px;
+    padding: 0 12px;
+    border: none;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    font-size: 13px;
+    cursor: pointer;
+    transition: all var(--transition-speed);
+}
+
+#view-mode-group .view-btn:not(:last-child) {
+    border-right: 1px solid var(--border);
+}
+
+#view-mode-group .view-btn.active {
+    background: var(--accent);
+    color: #fff;
+}
+
+/* ================================================================
+   Main Content Area
+   ================================================================ */
+#main-content {
+    display: flex;
+    flex: 1;
+    overflow: hidden;
+    position: relative;
+}
+
+/* ================================================================
+   Graph Canvas (2D)
+   ================================================================ */
+#graph-container {
+    flex: 1;
+    position: relative;
+    overflow: hidden;
+}
+
+#graph-container svg {
+    width: 100%;
+    height: 100%;
+}
+
+/* Node styling via D3 (also see JS) */
+.node-circle {
+    cursor: pointer;
+    stroke-width: 1.5px;
+    transition: stroke-width 0.15s;
+}
+
+.node-circle:hover {
+    stroke-width: 3px;
+}
+
+.node-label {
+    font-size: 11px;
+    fill: var(--text-secondary);
+    pointer-events: none;
+    user-select: none;
+    text-anchor: middle;
+}
+
+.link-line {
+    stroke-opacity: 0.35;
+}
+
+.link-label {
+    font-size: 9px;
+    fill: var(--text-muted);
+    pointer-events: none;
+    text-anchor: middle;
+}
+
+/* ================================================================
+   3D Canvas
+   ================================================================ */
+#three-container {
+    flex: 1;
+    position: relative;
+    display: none;
+    overflow: hidden;
+}
+
+#three-container canvas {
+    width: 100%;
+    height: 100%;
+}
+
+/* ================================================================
+   Timeline View
+   ================================================================ */
+#timeline-container {
+    flex: 1;
+    display: none;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+#timeline-controls {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    padding: 12px 16px;
+    background: var(--bg-secondary);
+    border-bottom: 1px solid var(--border);
+    flex-wrap: wrap;
+}
+
+#timeline-controls label {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+#timeline-controls input,
+#timeline-controls select {
+    height: 30px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+#timeline-list {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+}
+
+.timeline-event {
+    display: flex;
+    gap: 12px;
+    padding: 12px 0;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+    transition: background var(--transition-speed);
+}
+
+.timeline-event:hover {
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+    padding-left: 8px;
+}
+
+.tl-date {
+    font-size: 12px;
+    color: var(--text-muted);
+    min-width: 90px;
+    font-family: var(--font-mono);
+    flex-shrink: 0;
+}
+
+.tl-body {
+    flex: 1;
+}
+
+.tl-entity {
+    font-weight: 600;
+    font-size: 14px;
+    margin-bottom: 2px;
+}
+
+.tl-desc {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+}
+
+.tl-meta {
+    display: flex;
+    gap: 8px;
+    margin-top: 4px;
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+.tl-badge {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 4px;
+    font-size: 10px;
+    text-transform: uppercase;
+    font-weight: 600;
+}
+
+/* ================================================================
+   Entity Card Panel (Sidebar)
+   ================================================================ */
+#entity-panel {
+    width: var(--panel-width);
+    background: var(--bg-secondary);
+    border-left: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    transform: translateX(100%);
+    transition: transform var(--transition-speed) ease;
+    position: absolute;
+    right: 0;
+    top: 0;
+    bottom: 0;
+    z-index: 50;
+}
+
+#entity-panel.open {
+    transform: translateX(0);
+}
+
+#entity-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 16px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+}
+
+#entity-panel-header h2 {
+    font-size: 18px;
+    font-weight: 700;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+}
+
+#entity-panel-close {
+    width: 32px;
+    height: 32px;
+    border: none;
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    cursor: pointer;
+    font-size: 18px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    margin-left: 8px;
+}
+
+#entity-panel-close:hover {
+    background: var(--danger);
+    color: #fff;
+}
+
+#entity-panel-body {
+    flex: 1;
+    overflow-y: auto;
+    padding: 16px;
+}
+
+/* Score gauge */
+.score-gauge-container {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+}
+
+.score-gauge {
+    position: relative;
+    width: 72px;
+    height: 72px;
+    flex-shrink: 0;
+}
+
+.score-gauge svg {
+    transform: rotate(-90deg);
+}
+
+.score-gauge .gauge-bg {
+    fill: none;
+    stroke: var(--bg-tertiary);
+    stroke-width: 6;
+}
+
+.score-gauge .gauge-fill {
+    fill: none;
+    stroke-width: 6;
+    stroke-linecap: round;
+    transition: stroke-dashoffset 0.6s ease;
+}
+
+.score-gauge .gauge-text {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 18px;
+    font-weight: 700;
+    font-family: var(--font-mono);
+}
+
+.score-info .score-label {
+    font-size: 14px;
+    font-weight: 700;
+    text-transform: uppercase;
+}
+
+.score-info .score-sublabel {
+    font-size: 12px;
+    color: var(--text-muted);
+    margin-top: 2px;
+}
+
+/* Card sections */
+.card-section {
+    margin-bottom: 20px;
+}
+
+.card-section-title {
+    font-size: 12px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    letter-spacing: 0.05em;
+    margin-bottom: 8px;
+    padding-bottom: 4px;
+    border-bottom: 1px solid var(--border);
+}
+
+.card-meta-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+}
+
+.card-meta-item {
+    display: flex;
+    flex-direction: column;
+}
+
+.card-meta-label {
+    font-size: 11px;
+    color: var(--text-muted);
+    text-transform: uppercase;
+}
+
+.card-meta-value {
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.card-aliases {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.card-alias-tag {
+    display: inline-block;
+    padding: 2px 8px;
+    font-size: 12px;
+    border-radius: 4px;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+}
+
+/* Evidence list in card */
+.evidence-item {
+    padding: 8px 0;
+    border-bottom: 1px solid var(--border);
+}
+
+.evidence-item:last-child {
+    border-bottom: none;
+}
+
+.evidence-type {
+    display: inline-block;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    background: var(--bg-tertiary);
+    color: var(--text-secondary);
+    margin-right: 4px;
+}
+
+.evidence-context {
+    font-size: 13px;
+    color: var(--text-secondary);
+    line-height: 1.4;
+    margin-top: 4px;
+}
+
+.evidence-score {
+    font-size: 11px;
+    color: var(--text-muted);
+    margin-top: 2px;
+    font-family: var(--font-mono);
+}
+
+/* Connection list in card */
+.connection-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 0;
+    cursor: pointer;
+    transition: background var(--transition-speed);
+    border-radius: 4px;
+}
+
+.connection-item:hover {
+    background: var(--bg-tertiary);
+    padding-left: 4px;
+}
+
+.connection-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.connection-name {
+    font-size: 13px;
+    font-weight: 500;
+    flex: 1;
+}
+
+.connection-rel {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* Timeline in card */
+.card-timeline-item {
+    display: flex;
+    gap: 8px;
+    padding: 4px 0;
+    font-size: 12px;
+}
+
+.card-tl-date {
+    color: var(--text-muted);
+    font-family: var(--font-mono);
+    min-width: 80px;
+    flex-shrink: 0;
+}
+
+.card-tl-desc {
+    color: var(--text-secondary);
+    line-height: 1.3;
+}
+
+/* ================================================================
+   Control Panel (filters sidebar - left)
+   ================================================================ */
+#filter-panel {
+    width: 260px;
+    background: var(--bg-secondary);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+    overflow-y: auto;
+    flex-shrink: 0;
+    transition: margin-left var(--transition-speed);
+}
+
+#filter-panel.collapsed {
+    margin-left: -260px;
+}
+
+.filter-section {
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--border);
+}
+
+.filter-section-title {
+    font-size: 11px;
+    font-weight: 700;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    letter-spacing: 0.05em;
+    margin-bottom: 10px;
+}
+
+.filter-row {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 10px;
+}
+
+.filter-label {
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.filter-input,
+.filter-select {
+    height: 30px;
+    padding: 0 8px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    background: var(--bg-tertiary);
+    color: var(--text-primary);
+    font-size: 13px;
+}
+
+.filter-range-display {
+    font-size: 12px;
+    color: var(--text-muted);
+    text-align: right;
+    font-family: var(--font-mono);
+}
+
+.filter-checkbox-row {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 6px;
+}
+
+.filter-checkbox-row label {
+    font-size: 13px;
+    color: var(--text-secondary);
+    cursor: pointer;
+}
+
+.filter-checkbox-row input[type="checkbox"] {
+    accent-color: var(--accent);
+}
+
+/* Entity type colour legend */
+.legend-item {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-bottom: 4px;
+    font-size: 12px;
+    color: var(--text-secondary);
+}
+
+.legend-swatch {
+    width: 12px;
+    height: 12px;
+    border-radius: 3px;
+    flex-shrink: 0;
+}
+
+/* ================================================================
+   Tooltip
+   ================================================================ */
+#tooltip {
+    position: absolute;
+    pointer-events: none;
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 10px 14px;
+    box-shadow: 0 8px 24px var(--shadow);
+    z-index: 300;
+    max-width: 280px;
+    display: none;
+    font-size: 13px;
+}
+
+#tooltip.visible {
+    display: block;
+}
+
+#tooltip .tt-name {
+    font-weight: 700;
+    font-size: 14px;
+    margin-bottom: 4px;
+}
+
+#tooltip .tt-type {
+    font-size: 11px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    margin-bottom: 6px;
+}
+
+#tooltip .tt-score-bar {
+    height: 6px;
+    background: var(--bg-tertiary);
+    border-radius: 3px;
+    overflow: hidden;
+    margin-bottom: 4px;
+}
+
+#tooltip .tt-score-fill {
+    height: 100%;
+    border-radius: 3px;
+    transition: width 0.3s;
+}
+
+#tooltip .tt-meta {
+    font-size: 11px;
+    color: var(--text-muted);
+}
+
+/* ================================================================
+   Loading Overlay
+   ================================================================ */
+#loading-overlay {
+    position: fixed;
+    inset: 0;
+    background: var(--bg-primary);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    z-index: 1000;
+    transition: opacity 0.4s;
+}
+
+#loading-overlay.hidden {
+    opacity: 0;
+    pointer-events: none;
+}
+
+.spinner {
+    width: 48px;
+    height: 48px;
+    border: 4px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.8s linear infinite;
+    margin-bottom: 16px;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+#loading-text {
+    font-size: 14px;
+    color: var(--text-secondary);
+}
+
+/* ================================================================
+   Error state
+   ================================================================ */
+#error-banner {
+    display: none;
+    padding: 12px 16px;
+    background: rgba(230, 57, 70, 0.15);
+    border: 1px solid var(--danger);
+    border-radius: 8px;
+    color: var(--danger);
+    font-size: 13px;
+    margin: 16px;
+    text-align: center;
+}
+
+#error-banner.visible {
+    display: block;
+}
+
+/* ================================================================
+   Stats bar (bottom)
+   ================================================================ */
+#stats-bar {
+    display: flex;
+    align-items: center;
+    height: 28px;
+    padding: 0 16px;
+    background: var(--bg-secondary);
+    border-top: 1px solid var(--border);
+    font-size: 11px;
+    color: var(--text-muted);
+    gap: 16px;
+    flex-shrink: 0;
+}
+
+.stat-item {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.stat-value {
+    font-weight: 600;
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+}
+
+/* ================================================================
+   Responsive adjustments
+   ================================================================ */
+@media (max-width: 900px) {
+    #filter-panel {
+        position: absolute;
+        left: 0;
+        top: 0;
+        bottom: 0;
+        z-index: 60;
+        box-shadow: 4px 0 24px var(--shadow);
+    }
+    #filter-panel.collapsed {
+        margin-left: -260px;
+    }
+    #entity-panel {
+        width: 100%;
+        max-width: 420px;
+    }
+    :root {
+        --panel-width: 100%;
+    }
+}
+
+/* ================================================================
+   Scrollbar styling
+   ================================================================ */
+::-webkit-scrollbar {
+    width: 6px;
+}
+::-webkit-scrollbar-track {
+    background: var(--bg-primary);
+}
+::-webkit-scrollbar-thumb {
+    background: var(--border);
+    border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+    background: var(--border-light);
+}
+</style>
+</head>
+
+<body>
+<div id="app">
+
+    <!-- Loading overlay -->
+    <div id="loading-overlay">
+        <div class="spinner"></div>
+        <div id="loading-text">Loading evidence board...</div>
+    </div>
+
+    <!-- Toolbar -->
+    <div id="toolbar">
+        <div class="brand">
+            <div class="brand-icon">E</div>
+            <span>Evidence Board</span>
+        </div>
+
+        <button class="toolbar-btn" id="btn-toggle-filters" title="Toggle filter panel">
+            Filters
+        </button>
+
+        <div class="toolbar-sep"></div>
+
+        <div id="search-container">
+            <input type="text" id="search-input" placeholder="Search entities..." autocomplete="off">
+            <button id="search-clear">&times;</button>
+            <div id="autocomplete-list"></div>
+        </div>
+
+        <div class="toolbar-sep"></div>
+
+        <div id="view-mode-group">
+            <button class="view-btn active" data-view="graph">2D Graph</button>
+            <button class="view-btn" data-view="3d">3D View</button>
+            <button class="view-btn" data-view="timeline">Timeline</button>
+        </div>
+
+        <div class="toolbar-sep"></div>
+
+        <button class="toolbar-btn" id="btn-export-png" title="Export current view as PNG">
+            Export PNG
+        </button>
+        <button class="toolbar-btn" id="btn-toggle-labels" title="Toggle node labels">
+            Labels
+        </button>
+        <button class="toolbar-btn" id="btn-theme-toggle" title="Toggle light/dark theme">
+            Theme
+        </button>
+    </div>
+
+    <!-- Main content -->
+    <div id="main-content">
+
+        <!-- Filter panel (left sidebar) -->
+        <div id="filter-panel">
+            <div class="filter-section">
+                <div class="filter-section-title">Entity Type</div>
+                <div id="type-filters"></div>
+            </div>
+
+            <div class="filter-section">
+                <div class="filter-section-title">Score Range</div>
+                <div class="filter-row">
+                    <label class="filter-label">Minimum Score</label>
+                    <input type="range" id="filter-min-score" class="filter-input" min="0" max="100" value="0">
+                    <div class="filter-range-display" id="filter-min-score-display">0</div>
+                </div>
+                <div class="filter-row">
+                    <label class="filter-label">Maximum Score</label>
+                    <input type="range" id="filter-max-score" class="filter-input" min="0" max="100" value="100">
+                    <div class="filter-range-display" id="filter-max-score-display">100</div>
+                </div>
+            </div>
+
+            <div class="filter-section">
+                <div class="filter-section-title">Display Options</div>
+                <div class="filter-checkbox-row">
+                    <input type="checkbox" id="opt-show-labels" checked>
+                    <label for="opt-show-labels">Show Labels</label>
+                </div>
+                <div class="filter-checkbox-row">
+                    <input type="checkbox" id="opt-show-edge-labels">
+                    <label for="opt-show-edge-labels">Show Edge Types</label>
+                </div>
+                <div class="filter-checkbox-row">
+                    <input type="checkbox" id="opt-show-inferred">
+                    <label for="opt-show-inferred">Show Inferred Links</label>
+                </div>
+            </div>
+
+            <div class="filter-section">
+                <div class="filter-section-title">Edge Type Filter</div>
+                <div id="edge-type-filters"></div>
+            </div>
+
+            <div class="filter-section">
+                <div class="filter-section-title">Legend</div>
+                <div id="legend-container"></div>
+            </div>
+        </div>
+
+        <!-- 2D Graph -->
+        <div id="graph-container">
+            <svg id="graph-svg"></svg>
+            <div id="tooltip">
+                <div class="tt-name"></div>
+                <div class="tt-type"></div>
+                <div class="tt-score-bar"><div class="tt-score-fill"></div></div>
+                <div class="tt-meta"></div>
+            </div>
+            <div id="error-banner"></div>
+        </div>
+
+        <!-- 3D container -->
+        <div id="three-container"></div>
+
+        <!-- Timeline -->
+        <div id="timeline-container">
+            <div id="timeline-controls">
+                <label>Entity:</label>
+                <select id="tl-entity-filter">
+                    <option value="">All entities</option>
+                </select>
+                <label>Type:</label>
+                <select id="tl-type-filter">
+                    <option value="">All types</option>
+                </select>
+                <label>From:</label>
+                <input type="date" id="tl-date-from">
+                <label>To:</label>
+                <input type="date" id="tl-date-to">
+            </div>
+            <div id="timeline-list"></div>
+        </div>
+
+        <!-- Entity card panel (right sidebar) -->
+        <div id="entity-panel">
+            <div id="entity-panel-header">
+                <h2 id="entity-panel-title">Entity</h2>
+                <button id="entity-panel-close">&times;</button>
+            </div>
+            <div id="entity-panel-body"></div>
+        </div>
+    </div>
+
+    <!-- Stats bar -->
+    <div id="stats-bar">
+        <div class="stat-item">Nodes: <span class="stat-value" id="stat-nodes">0</span></div>
+        <div class="stat-item">Edges: <span class="stat-value" id="stat-edges">0</span></div>
+        <div class="stat-item">Visible: <span class="stat-value" id="stat-visible">0</span></div>
+        <div class="stat-item">View: <span class="stat-value" id="stat-view">2D Graph</span></div>
+        <div class="stat-item" style="margin-left:auto;">
+            Generated: <span class="stat-value" id="stat-generated">--</span>
+        </div>
+    </div>
+</div>
+
+<script>
+// =====================================================================
+// EpsteinAnalyzer Evidence Board - Application Logic
+// =====================================================================
+(function() {
+    'use strict';
+
+    // -----------------------------------------------------------------
+    // State
+    // -----------------------------------------------------------------
+    const state = {
+        graphData: null,       // { nodes: [], links: [], metadata: {} }
+        timelineData: null,    // { events: [], date_range: {}, metadata: {} }
+        entityCards: {},       // Cache of loaded entity cards by ID
+        currentView: 'graph', // 'graph' | '3d' | 'timeline'
+        selectedEntityId: null,
+        showLabels: true,
+        showEdgeLabels: false,
+        showInferred: false,
+        filterTypes: new Set(),
+        filterEdgeTypes: new Set(),
+        scoreRange: [0, 100],
+        simulation: null,     // D3 force simulation
+        threeScene: null,     // Three.js objects
+        highlightedNodes: new Set(),
+    };
+
+    // -----------------------------------------------------------------
+    // DOM references
+    // -----------------------------------------------------------------
+    const dom = {
+        app: document.getElementById('app'),
+        loading: document.getElementById('loading-overlay'),
+        loadingText: document.getElementById('loading-text'),
+        graphContainer: document.getElementById('graph-container'),
+        graphSvg: document.getElementById('graph-svg'),
+        threeContainer: document.getElementById('three-container'),
+        timelineContainer: document.getElementById('timeline-container'),
+        timelineList: document.getElementById('timeline-list'),
+        entityPanel: document.getElementById('entity-panel'),
+        entityPanelTitle: document.getElementById('entity-panel-title'),
+        entityPanelBody: document.getElementById('entity-panel-body'),
+        entityPanelClose: document.getElementById('entity-panel-close'),
+        filterPanel: document.getElementById('filter-panel'),
+        tooltip: document.getElementById('tooltip'),
+        searchInput: document.getElementById('search-input'),
+        searchClear: document.getElementById('search-clear'),
+        autocomplete: document.getElementById('autocomplete-list'),
+        errorBanner: document.getElementById('error-banner'),
+        statNodes: document.getElementById('stat-nodes'),
+        statEdges: document.getElementById('stat-edges'),
+        statVisible: document.getElementById('stat-visible'),
+        statView: document.getElementById('stat-view'),
+        statGenerated: document.getElementById('stat-generated'),
+        typeFilters: document.getElementById('type-filters'),
+        edgeTypeFilters: document.getElementById('edge-type-filters'),
+        legendContainer: document.getElementById('legend-container'),
+        filterMinScore: document.getElementById('filter-min-score'),
+        filterMaxScore: document.getElementById('filter-max-score'),
+        filterMinScoreDisplay: document.getElementById('filter-min-score-display'),
+        filterMaxScoreDisplay: document.getElementById('filter-max-score-display'),
+    };
+
+    // -----------------------------------------------------------------
+    // Constants
+    // -----------------------------------------------------------------
+    const TYPE_COLORS = {
+        person: '#e63946',
+        organization: '#457b9d',
+        location: '#2a9d8f',
+        aircraft: '#e9c46a',
+        financial: '#f4a261',
+        legal_case: '#264653',
+        contact_info: '#a8dadc',
+        event: '#6a4c93',
+        redacted_entity: '#6c757d',
+    };
+
+    function scoreColor(score) {
+        if (score >= 75) return '#e63946';
+        if (score >= 50) return '#f4a261';
+        if (score >= 25) return '#e9c46a';
+        return '#6b7280';
+    }
+
+    function scoreLabel(score) {
+        if (score >= 75) return 'HIGH';
+        if (score >= 50) return 'MEDIUM';
+        if (score >= 25) return 'LOW';
+        return 'MINIMAL';
+    }
+
+    // -----------------------------------------------------------------
+    // Data Loading
+    // -----------------------------------------------------------------
+    async function loadJSON(url) {
+        const resp = await fetch(url);
+        if (!resp.ok) throw new Error(`Failed to load ${url}: ${resp.status}`);
+        return resp.json();
+    }
+
+    async function loadData() {
+        dom.loadingText.textContent = 'Loading graph data...';
+        try {
+            state.graphData = await loadJSON('data/graph.json');
+        } catch (e) {
+            console.warn('Could not load data/graph.json, using placeholder data:', e.message);
+            state.graphData = generatePlaceholderData();
+        }
+
+        dom.loadingText.textContent = 'Loading timeline...';
+        try {
+            state.timelineData = await loadJSON('data/timeline.json');
+        } catch (e) {
+            console.warn('Could not load data/timeline.json, using empty timeline.');
+            state.timelineData = { events: [], date_range: {}, metadata: { event_count: 0 } };
+        }
+
+        // Update stats
+        dom.statNodes.textContent = state.graphData.nodes.length;
+        dom.statEdges.textContent = state.graphData.links.length;
+        dom.statGenerated.textContent = (state.graphData.metadata?.generated_at || '--').substring(0, 19);
+    }
+
+    /**
+     * If data/graph.json is unavailable, create minimal placeholder data
+     * so the UI remains functional and demonstrates the layout.
+     */
+    function generatePlaceholderData() {
+        return {
+            nodes: [],
+            links: [],
+            metadata: {
+                node_count: 0,
+                link_count: 0,
+                generated_at: new Date().toISOString(),
+                min_score: 0,
+                version: '1.0.0',
+                public: true,
+                placeholder: true
+            }
+        };
+    }
+
+    // -----------------------------------------------------------------
+    // Filtering
+    // -----------------------------------------------------------------
+    function buildFilters() {
+        // Entity type checkboxes
+        const types = new Set(state.graphData.nodes.map(n => n.type));
+        types.forEach(t => state.filterTypes.add(t));
+        dom.typeFilters.innerHTML = '';
+        types.forEach(t => {
+            const color = TYPE_COLORS[t] || '#999';
+            const row = document.createElement('div');
+            row.className = 'filter-checkbox-row';
+            row.innerHTML = `
+                <input type="checkbox" id="ft-${t}" data-type="${t}" checked>
+                <label for="ft-${t}" style="display:flex;align-items:center;gap:4px;">
+                    <span class="legend-swatch" style="background:${color};width:10px;height:10px;border-radius:2px;display:inline-block;"></span>
+                    ${t.replace(/_/g, ' ')}
+                </label>`;
+            row.querySelector('input').addEventListener('change', onTypeFilterChange);
+            dom.typeFilters.appendChild(row);
+        });
+
+        // Edge type checkboxes
+        const edgeTypes = new Set(state.graphData.links.map(l => l.type));
+        edgeTypes.forEach(t => state.filterEdgeTypes.add(t));
+        dom.edgeTypeFilters.innerHTML = '';
+        edgeTypes.forEach(t => {
+            const row = document.createElement('div');
+            row.className = 'filter-checkbox-row';
+            row.innerHTML = `
+                <input type="checkbox" id="fe-${t}" data-edge-type="${t}" checked>
+                <label for="fe-${t}">${t.replace(/_/g, ' ')}</label>`;
+            row.querySelector('input').addEventListener('change', onEdgeTypeFilterChange);
+            dom.edgeTypeFilters.appendChild(row);
+        });
+
+        // Legend
+        dom.legendContainer.innerHTML = '';
+        Object.entries(TYPE_COLORS).forEach(([type, color]) => {
+            if (types.has(type)) {
+                dom.legendContainer.innerHTML += `
+                    <div class="legend-item">
+                        <span class="legend-swatch" style="background:${color}"></span>
+                        ${type.replace(/_/g, ' ')}
+                    </div>`;
+            }
+        });
+
+        // Score colour legend
+        dom.legendContainer.innerHTML += `
+            <div style="margin-top:8px;font-size:11px;color:var(--text-muted);">Score Colours:</div>
+            <div class="legend-item"><span class="legend-swatch" style="background:#e63946"></span> High (75+)</div>
+            <div class="legend-item"><span class="legend-swatch" style="background:#f4a261"></span> Medium (50-74)</div>
+            <div class="legend-item"><span class="legend-swatch" style="background:#e9c46a"></span> Low (25-49)</div>
+            <div class="legend-item"><span class="legend-swatch" style="background:#6b7280"></span> Minimal (&lt;25)</div>`;
+
+        // Score range sliders
+        dom.filterMinScore.addEventListener('input', onScoreFilterChange);
+        dom.filterMaxScore.addEventListener('input', onScoreFilterChange);
+
+        // Timeline entity dropdown
+        const tlSelect = document.getElementById('tl-entity-filter');
+        const names = [...new Set(state.graphData.nodes.map(n => n.name))].sort();
+        names.forEach(n => {
+            const opt = document.createElement('option');
+            opt.value = n;
+            opt.textContent = n;
+            tlSelect.appendChild(opt);
+        });
+
+        // Timeline type dropdown
+        const tlTypeSelect = document.getElementById('tl-type-filter');
+        const docTypes = [...new Set((state.timelineData.events || []).map(e => e.doc_type))].filter(Boolean).sort();
+        docTypes.forEach(t => {
+            const opt = document.createElement('option');
+            opt.value = t;
+            opt.textContent = t;
+            tlTypeSelect.appendChild(opt);
+        });
+    }
+
+    function getFilteredData() {
+        const nodes = state.graphData.nodes.filter(n => {
+            if (!state.filterTypes.has(n.type)) return false;
+            const s = n.score || 0;
+            if (s < state.scoreRange[0] || s > state.scoreRange[1]) return false;
+            return true;
+        });
+        const nodeIds = new Set(nodes.map(n => n.id));
+        const links = state.graphData.links.filter(l => {
+            const srcId = typeof l.source === 'object' ? l.source.id : l.source;
+            const tgtId = typeof l.target === 'object' ? l.target.id : l.target;
+            if (!nodeIds.has(srcId) || !nodeIds.has(tgtId)) return false;
+            if (!state.filterEdgeTypes.has(l.type)) return false;
+            if (!state.showInferred && l.inferred) return false;
+            return true;
+        });
+        dom.statVisible.textContent = nodes.length;
+        return { nodes, links };
+    }
+
+    // Filter event handlers
+    function onTypeFilterChange(e) {
+        const t = e.target.dataset.type;
+        if (e.target.checked) state.filterTypes.add(t);
+        else state.filterTypes.delete(t);
+        updateGraph();
+    }
+
+    function onEdgeTypeFilterChange(e) {
+        const t = e.target.dataset.edgeType;
+        if (e.target.checked) state.filterEdgeTypes.add(t);
+        else state.filterEdgeTypes.delete(t);
+        updateGraph();
+    }
+
+    function onScoreFilterChange() {
+        const min = parseInt(dom.filterMinScore.value, 10);
+        const max = parseInt(dom.filterMaxScore.value, 10);
+        state.scoreRange = [Math.min(min, max), Math.max(min, max)];
+        dom.filterMinScoreDisplay.textContent = state.scoreRange[0];
+        dom.filterMaxScoreDisplay.textContent = state.scoreRange[1];
+        updateGraph();
+    }
+
+    // -----------------------------------------------------------------
+    // 2D Graph (D3 Force-Directed)
+    // -----------------------------------------------------------------
+    let svgGroup, linkGroup, nodeGroup, labelGroup, edgeLabelGroup;
+    let zoomBehavior;
+
+    function initGraph() {
+        const svg = d3.select('#graph-svg');
+        const width = dom.graphContainer.clientWidth;
+        const height = dom.graphContainer.clientHeight;
+
+        svg.attr('viewBox', [0, 0, width, height]);
+
+        // Zoom
+        zoomBehavior = d3.zoom()
+            .scaleExtent([0.1, 8])
+            .on('zoom', (event) => {
+                svgGroup.attr('transform', event.transform);
+            });
+        svg.call(zoomBehavior);
+
+        svgGroup = svg.append('g');
+        linkGroup = svgGroup.append('g').attr('class', 'links');
+        edgeLabelGroup = svgGroup.append('g').attr('class', 'edge-labels');
+        nodeGroup = svgGroup.append('g').attr('class', 'nodes');
+        labelGroup = svgGroup.append('g').attr('class', 'labels');
+
+        // Arrow marker
+        svg.append('defs').append('marker')
+            .attr('id', 'arrowhead')
+            .attr('viewBox', '0 -3 6 6')
+            .attr('refX', 18)
+            .attr('refY', 0)
+            .attr('markerWidth', 6)
+            .attr('markerHeight', 6)
+            .attr('orient', 'auto')
+            .append('path')
+            .attr('d', 'M0,-3L6,0L0,3')
+            .attr('fill', 'var(--text-muted)');
+
+        updateGraph();
+    }
+
+    function updateGraph() {
+        if (state.currentView !== 'graph') return;
+        const { nodes, links } = getFilteredData();
+        const width = dom.graphContainer.clientWidth;
+        const height = dom.graphContainer.clientHeight;
+
+        // Stop old simulation
+        if (state.simulation) state.simulation.stop();
+
+        // Deep copy nodes to avoid D3 mutation issues
+        const simNodes = nodes.map(n => ({...n}));
+        const simLinks = links.map(l => ({
+            ...l,
+            source: typeof l.source === 'object' ? l.source.id : l.source,
+            target: typeof l.target === 'object' ? l.target.id : l.target,
+        }));
+
+        // Force simulation
+        state.simulation = d3.forceSimulation(simNodes)
+            .force('link', d3.forceLink(simLinks).id(d => d.id).distance(d => 100 / (d.weight || 1)))
+            .force('charge', d3.forceManyBody().strength(-200))
+            .force('center', d3.forceCenter(width / 2, height / 2))
+            .force('collision', d3.forceCollide().radius(d => (d.radius || 8) + 4))
+            .alphaDecay(0.02);
+
+        // Links
+        const linkSel = linkGroup.selectAll('.link-line')
+            .data(simLinks, d => `${d.source.id || d.source}-${d.target.id || d.target}-${d.type}`);
+        linkSel.exit().remove();
+        const linkEnter = linkSel.enter().append('line')
+            .attr('class', 'link-line')
+            .attr('stroke', d => d.inferred ? '#4b5563' : '#6b7280')
+            .attr('stroke-dasharray', d => d.inferred ? '4,3' : 'none')
+            .attr('stroke-width', d => d.width || 1);
+        const linkMerge = linkEnter.merge(linkSel);
+
+        // Edge labels
+        const edgeLabelSel = edgeLabelGroup.selectAll('.link-label')
+            .data(simLinks, d => `${d.source.id || d.source}-${d.target.id || d.target}-${d.type}`);
+        edgeLabelSel.exit().remove();
+        const edgeLabelEnter = edgeLabelSel.enter().append('text')
+            .attr('class', 'link-label')
+            .text(d => (d.type || '').replace(/_/g, ' '));
+        const edgeLabelMerge = edgeLabelEnter.merge(edgeLabelSel)
+            .style('display', state.showEdgeLabels ? 'block' : 'none');
+
+        // Nodes
+        const nodeSel = nodeGroup.selectAll('.node-circle')
+            .data(simNodes, d => d.id);
+        nodeSel.exit().remove();
+        const nodeEnter = nodeSel.enter().append('circle')
+            .attr('class', 'node-circle')
+            .attr('r', d => d.radius || 8)
+            .attr('fill', d => d.score_color || scoreColor(d.score || 0))
+            .attr('stroke', d => d.color || TYPE_COLORS[d.type] || '#999')
+            .call(d3.drag()
+                .on('start', dragStarted)
+                .on('drag', dragged)
+                .on('end', dragEnded))
+            .on('click', (event, d) => { event.stopPropagation(); selectEntity(d.id); })
+            .on('mouseover', showTooltip)
+            .on('mousemove', moveTooltip)
+            .on('mouseout', hideTooltip);
+        const nodeMerge = nodeEnter.merge(nodeSel)
+            .attr('r', d => d.radius || 8)
+            .attr('fill', d => {
+                if (state.highlightedNodes.size > 0) {
+                    return state.highlightedNodes.has(d.id) ? (d.score_color || scoreColor(d.score || 0)) : '#2a2a3a';
+                }
+                return d.score_color || scoreColor(d.score || 0);
+            })
+            .attr('opacity', d => {
+                if (state.highlightedNodes.size > 0 && !state.highlightedNodes.has(d.id)) return 0.2;
+                return 1;
+            });
+
+        // Labels
+        const labelSel = labelGroup.selectAll('.node-label')
+            .data(simNodes, d => d.id);
+        labelSel.exit().remove();
+        const labelEnter = labelSel.enter().append('text')
+            .attr('class', 'node-label')
+            .attr('dy', d => (d.radius || 8) + 14)
+            .text(d => d.name.length > 20 ? d.name.substring(0, 18) + '...' : d.name);
+        const labelMerge = labelEnter.merge(labelSel)
+            .style('display', state.showLabels ? 'block' : 'none');
+
+        // Tick
+        state.simulation.on('tick', () => {
+            linkMerge
+                .attr('x1', d => d.source.x)
+                .attr('y1', d => d.source.y)
+                .attr('x2', d => d.target.x)
+                .attr('y2', d => d.target.y);
+
+            edgeLabelMerge
+                .attr('x', d => (d.source.x + d.target.x) / 2)
+                .attr('y', d => (d.source.y + d.target.y) / 2);
+
+            nodeMerge
+                .attr('cx', d => d.x)
+                .attr('cy', d => d.y);
+
+            labelMerge
+                .attr('x', d => d.x)
+                .attr('y', d => d.y);
+        });
+    }
+
+    // Drag handlers
+    function dragStarted(event, d) {
+        if (!event.active) state.simulation.alphaTarget(0.3).restart();
+        d.fx = d.x;
+        d.fy = d.y;
+    }
+    function dragged(event, d) {
+        d.fx = event.x;
+        d.fy = event.y;
+    }
+    function dragEnded(event, d) {
+        if (!event.active) state.simulation.alphaTarget(0);
+        d.fx = null;
+        d.fy = null;
+    }
+
+    // -----------------------------------------------------------------
+    // Tooltip
+    // -----------------------------------------------------------------
+    function showTooltip(event, d) {
+        const tt = dom.tooltip;
+        tt.querySelector('.tt-name').textContent = d.name;
+        tt.querySelector('.tt-type').textContent = (d.type || '').replace(/_/g, ' ');
+        const fill = tt.querySelector('.tt-score-fill');
+        const s = d.score || 0;
+        fill.style.width = s + '%';
+        fill.style.background = scoreColor(s);
+        tt.querySelector('.tt-meta').textContent =
+            `Score: ${s}/100 (${scoreLabel(s)}) | Evidence: ${d.evidence_count || 0} | Docs: ${d.document_count || 0}`;
+        tt.classList.add('visible');
+    }
+
+    function moveTooltip(event) {
+        const tt = dom.tooltip;
+        const rect = dom.graphContainer.getBoundingClientRect();
+        let x = event.clientX - rect.left + 16;
+        let y = event.clientY - rect.top + 16;
+        if (x + 280 > rect.width) x = event.clientX - rect.left - 290;
+        if (y + 100 > rect.height) y = event.clientY - rect.top - 110;
+        tt.style.left = x + 'px';
+        tt.style.top = y + 'px';
+    }
+
+    function hideTooltip() {
+        dom.tooltip.classList.remove('visible');
+    }
+
+    // -----------------------------------------------------------------
+    // 3D View (Three.js)
+    // -----------------------------------------------------------------
+    function init3DView() {
+        const container = dom.threeContainer;
+        const width = container.clientWidth || window.innerWidth;
+        const height = container.clientHeight || window.innerHeight - 84;
+
+        const scene = new THREE.Scene();
+        scene.background = new THREE.Color(0x0a0e17);
+        scene.fog = new THREE.FogExp2(0x0a0e17, 0.0008);
+
+        const camera = new THREE.PerspectiveCamera(60, width / height, 1, 5000);
+        camera.position.set(0, 0, 600);
+
+        const renderer = new THREE.WebGLRenderer({ antialias: true });
+        renderer.setSize(width, height);
+        renderer.setPixelRatio(window.devicePixelRatio);
+        container.innerHTML = '';
+        container.appendChild(renderer.domElement);
+
+        // OrbitControls
+        let controls;
+        if (typeof THREE.OrbitControls !== 'undefined') {
+            controls = new THREE.OrbitControls(camera, renderer.domElement);
+            controls.enableDamping = true;
+            controls.dampingFactor = 0.05;
+            controls.minDistance = 50;
+            controls.maxDistance = 2000;
+        }
+
+        const { nodes, links } = getFilteredData();
+
+        // Node spheres
+        const nodeMap = {};
+        const nodeGroup3D = new THREE.Group();
+        nodes.forEach(n => {
+            const radius = (n.radius || 8) * 0.5;
+            const geo = new THREE.SphereGeometry(radius, 16, 16);
+            const color = new THREE.Color(n.score_color || scoreColor(n.score || 0));
+            const mat = new THREE.MeshPhongMaterial({ color, emissive: color, emissiveIntensity: 0.3 });
+            const mesh = new THREE.Mesh(geo, mat);
+            mesh.position.set(
+                (n.x || (Math.random() - 0.5) * 400),
+                (n.y || (Math.random() - 0.5) * 400),
+                (n.z || (Math.random() - 0.5) * 200)
+            );
+            mesh.userData = n;
+            nodeGroup3D.add(mesh);
+            nodeMap[n.id] = mesh;
+        });
+        scene.add(nodeGroup3D);
+
+        // Edge lines
+        const edgeGroup3D = new THREE.Group();
+        links.forEach(l => {
+            const srcId = typeof l.source === 'object' ? l.source.id : l.source;
+            const tgtId = typeof l.target === 'object' ? l.target.id : l.target;
+            const src = nodeMap[srcId];
+            const tgt = nodeMap[tgtId];
+            if (!src || !tgt) return;
+            const geo = new THREE.BufferGeometry().setFromPoints([
+                src.position, tgt.position
+            ]);
+            const mat = new THREE.LineBasicMaterial({
+                color: l.inferred ? 0x4b5563 : 0x6b7280,
+                opacity: 0.4,
+                transparent: true
+            });
+            const line = new THREE.Line(geo, mat);
+            edgeGroup3D.add(line);
+        });
+        scene.add(edgeGroup3D);
+
+        // Particles along connections
+        const particleCount = Math.min(links.length * 2, 500);
+        const pGeo = new THREE.BufferGeometry();
+        const pPositions = new Float32Array(particleCount * 3);
+        const pColors = new Float32Array(particleCount * 3);
+        for (let i = 0; i < particleCount; i++) {
+            pPositions[i * 3] = (Math.random() - 0.5) * 600;
+            pPositions[i * 3 + 1] = (Math.random() - 0.5) * 600;
+            pPositions[i * 3 + 2] = (Math.random() - 0.5) * 300;
+            const c = new THREE.Color(0x3b82f6);
+            pColors[i * 3] = c.r;
+            pColors[i * 3 + 1] = c.g;
+            pColors[i * 3 + 2] = c.b;
+        }
+        pGeo.setAttribute('position', new THREE.BufferAttribute(pPositions, 3));
+        pGeo.setAttribute('color', new THREE.BufferAttribute(pColors, 3));
+        const pMat = new THREE.PointsMaterial({
+            size: 1.5,
+            vertexColors: true,
+            transparent: true,
+            opacity: 0.6,
+            blending: THREE.AdditiveBlending,
+        });
+        const particles = new THREE.Points(pGeo, pMat);
+        scene.add(particles);
+
+        // Lights
+        scene.add(new THREE.AmbientLight(0xffffff, 0.4));
+        const dLight = new THREE.DirectionalLight(0xffffff, 0.6);
+        dLight.position.set(200, 300, 400);
+        scene.add(dLight);
+
+        // Raycaster for click selection
+        const raycaster = new THREE.Raycaster();
+        const mouse = new THREE.Vector2();
+        renderer.domElement.addEventListener('click', (e) => {
+            const rect = renderer.domElement.getBoundingClientRect();
+            mouse.x = ((e.clientX - rect.left) / rect.width) * 2 - 1;
+            mouse.y = -((e.clientY - rect.top) / rect.height) * 2 + 1;
+            raycaster.setFromCamera(mouse, camera);
+            const hits = raycaster.intersectObjects(nodeGroup3D.children);
+            if (hits.length > 0) {
+                const nodeData = hits[0].object.userData;
+                if (nodeData && nodeData.id) selectEntity(nodeData.id);
+            }
+        });
+
+        // Animate
+        let animId;
+        function animate() {
+            animId = requestAnimationFrame(animate);
+            // Rotate particles slowly
+            const pos = particles.geometry.attributes.position.array;
+            for (let i = 0; i < particleCount; i++) {
+                pos[i * 3 + 1] += Math.sin(Date.now() * 0.001 + i) * 0.05;
+            }
+            particles.geometry.attributes.position.needsUpdate = true;
+            if (controls) controls.update();
+            renderer.render(scene, camera);
+        }
+        animate();
+
+        // Handle resize
+        const onResize = () => {
+            const w = container.clientWidth;
+            const h = container.clientHeight;
+            camera.aspect = w / h;
+            camera.updateProjectionMatrix();
+            renderer.setSize(w, h);
+        };
+        window.addEventListener('resize', onResize);
+
+        // Store for cleanup
+        state.threeScene = { scene, camera, renderer, controls, animId, onResize };
+    }
+
+    function destroy3DView() {
+        if (!state.threeScene) return;
+        cancelAnimationFrame(state.threeScene.animId);
+        window.removeEventListener('resize', state.threeScene.onResize);
+        if (state.threeScene.renderer) {
+            state.threeScene.renderer.dispose();
+        }
+        dom.threeContainer.innerHTML = '';
+        state.threeScene = null;
+    }
+
+    // -----------------------------------------------------------------
+    // Timeline View
+    // -----------------------------------------------------------------
+    function renderTimeline() {
+        const events = state.timelineData?.events || [];
+        const entityFilter = document.getElementById('tl-entity-filter').value;
+        const typeFilter = document.getElementById('tl-type-filter').value;
+        const dateFrom = document.getElementById('tl-date-from').value;
+        const dateTo = document.getElementById('tl-date-to').value;
+
+        let filtered = events;
+        if (entityFilter) filtered = filtered.filter(e => e.entity_name === entityFilter);
+        if (typeFilter) filtered = filtered.filter(e => e.doc_type === typeFilter);
+        if (dateFrom) filtered = filtered.filter(e => e.date >= dateFrom);
+        if (dateTo) filtered = filtered.filter(e => e.date <= dateTo);
+
+        dom.timelineList.innerHTML = '';
+
+        if (filtered.length === 0) {
+            dom.timelineList.innerHTML = '<div style="padding:32px;text-align:center;color:var(--text-muted);">No events match the current filters.</div>';
+            return;
+        }
+
+        filtered.forEach(ev => {
+            const div = document.createElement('div');
+            div.className = 'timeline-event';
+            div.innerHTML = `
+                <div class="tl-date">${ev.date || '--'}</div>
+                <div class="tl-body">
+                    <div class="tl-entity" style="color:${TYPE_COLORS[ev.entity_type] || '#999'}">${ev.entity_name || 'Unknown'}</div>
+                    <div class="tl-desc">${ev.description || ''}</div>
+                    <div class="tl-meta">
+                        <span class="tl-badge" style="background:${scoreColor(ev.damning_score || 0)};color:#fff;">${ev.doc_type || 'doc'}</span>
+                        <span>Score: ${ev.damning_score || 0}</span>
+                        <span>Source: ${ev.source || 'unknown'}</span>
+                    </div>
+                </div>`;
+            div.addEventListener('click', () => {
+                if (ev.entity_id) selectEntity(ev.entity_id);
+            });
+            dom.timelineList.appendChild(div);
+        });
+    }
+
+    // Bind timeline filter events
+    function bindTimelineFilters() {
+        document.getElementById('tl-entity-filter').addEventListener('change', renderTimeline);
+        document.getElementById('tl-type-filter').addEventListener('change', renderTimeline);
+        document.getElementById('tl-date-from').addEventListener('change', renderTimeline);
+        document.getElementById('tl-date-to').addEventListener('change', renderTimeline);
+    }
+
+    // -----------------------------------------------------------------
+    // Entity Card Panel
+    // -----------------------------------------------------------------
+    async function selectEntity(entityId) {
+        state.selectedEntityId = entityId;
+        const node = state.graphData.nodes.find(n => n.id === entityId);
+        if (!node) return;
+
+        dom.entityPanelTitle.textContent = node.name;
+        dom.entityPanel.classList.add('open');
+
+        // Highlight in graph
+        highlightEntityInGraph(entityId);
+
+        // Try to load detailed card, fall back to graph node data
+        let card = state.entityCards[entityId];
+        if (!card) {
+            try {
+                card = await loadJSON(`data/entities/${entityId}.json`);
+                state.entityCards[entityId] = card;
+            } catch (e) {
+                // Build from graph data
+                card = buildCardFromNode(node);
+            }
+        }
+
+        renderEntityCard(card, node);
+    }
+
+    function buildCardFromNode(node) {
+        // Fallback card from graph data
+        const connections = state.graphData.links
+            .filter(l => {
+                const s = typeof l.source === 'object' ? l.source.id : l.source;
+                const t = typeof l.target === 'object' ? l.target.id : l.target;
+                return s === node.id || t === node.id;
+            })
+            .map(l => {
+                const s = typeof l.source === 'object' ? l.source.id : l.source;
+                const t = typeof l.target === 'object' ? l.target.id : l.target;
+                const otherId = s === node.id ? t : s;
+                const other = state.graphData.nodes.find(n => n.id === otherId);
+                return {
+                    entity_id: otherId,
+                    name: other ? other.name : `Entity ${otherId}`,
+                    type: other ? other.type : 'unknown',
+                    rel_type: (l.type || '').replace(/_/g, ' '),
+                    weight: l.weight || 1
+                };
+            });
+
+        return {
+            entity: {
+                id: node.id,
+                name: node.name,
+                type: node.type,
+                score: node.score || 0,
+                score_label: scoreLabel(node.score || 0),
+                score_color: scoreColor(node.score || 0),
+                role: node.role || null,
+                aliases: node.aliases || [],
+                evidence_count: node.evidence_count || 0,
+                document_count: node.document_count || 0,
+                connection_count: connections.length,
+            },
+            top_evidence: [],
+            connections: connections,
+            timeline: []
+        };
+    }
+
+    function renderEntityCard(card, node) {
+        const e = card.entity || {};
+        const score = e.score || 0;
+        const sc = e.score_color || scoreColor(score);
+
+        // Gauge SVG
+        const circumference = 2 * Math.PI * 30;
+        const offset = circumference - (score / 100) * circumference;
+
+        let html = `
+        <div class="score-gauge-container">
+            <div class="score-gauge">
+                <svg width="72" height="72" viewBox="0 0 72 72">
+                    <circle class="gauge-bg" cx="36" cy="36" r="30"/>
+                    <circle class="gauge-fill" cx="36" cy="36" r="30"
+                            stroke="${sc}"
+                            stroke-dasharray="${circumference}"
+                            stroke-dashoffset="${offset}"/>
+                </svg>
+                <div class="gauge-text" style="color:${sc}">${score}</div>
+            </div>
+            <div class="score-info">
+                <div class="score-label" style="color:${sc}">${e.score_label || scoreLabel(score)}</div>
+                <div class="score-sublabel">Implication Score</div>
+            </div>
+        </div>
+
+        <div class="card-section">
+            <div class="card-section-title">Details</div>
+            <div class="card-meta-grid">
+                <div class="card-meta-item">
+                    <span class="card-meta-label">Type</span>
+                    <span class="card-meta-value" style="color:${TYPE_COLORS[e.type] || '#999'}">${(e.type || '').replace(/_/g, ' ')}</span>
+                </div>
+                <div class="card-meta-item">
+                    <span class="card-meta-label">Role</span>
+                    <span class="card-meta-value">${e.role || 'N/A'}</span>
+                </div>
+                <div class="card-meta-item">
+                    <span class="card-meta-label">Evidence</span>
+                    <span class="card-meta-value">${e.evidence_count || 0}</span>
+                </div>
+                <div class="card-meta-item">
+                    <span class="card-meta-label">Documents</span>
+                    <span class="card-meta-value">${e.document_count || 0}</span>
+                </div>
+                <div class="card-meta-item">
+                    <span class="card-meta-label">Connections</span>
+                    <span class="card-meta-value">${e.connection_count || 0}</span>
+                </div>
+            </div>
+        </div>`;
+
+        // Aliases
+        if (e.aliases && e.aliases.length > 0) {
+            html += `<div class="card-section">
+                <div class="card-section-title">Aliases</div>
+                <div class="card-aliases">
+                    ${e.aliases.map(a => `<span class="card-alias-tag">${a}</span>`).join('')}
+                </div>
+            </div>`;
+        }
+
+        // Top evidence
+        if (card.top_evidence && card.top_evidence.length > 0) {
+            html += `<div class="card-section"><div class="card-section-title">Top Evidence</div>`;
+            card.top_evidence.forEach(ev => {
+                html += `<div class="evidence-item">
+                    <span class="evidence-type" style="background:${scoreColor(ev.damning_score || 0)};color:#fff;">
+                        ${ev.doc_type || 'doc'}
+                    </span>
+                    <div class="evidence-context">${ev.context || '(no context available)'}</div>
+                    <div class="evidence-score">Score: ${ev.damning_score || 0}/100 | Source: ${ev.source || 'unknown'}</div>
+                </div>`;
+            });
+            html += `</div>`;
+        }
+
+        // Connections
+        if (card.connections && card.connections.length > 0) {
+            html += `<div class="card-section"><div class="card-section-title">Connections (${card.connections.length})</div>`;
+            card.connections.forEach(c => {
+                html += `<div class="connection-item" data-entity-id="${c.entity_id}">
+                    <span class="connection-dot" style="background:${TYPE_COLORS[c.type] || '#999'}"></span>
+                    <span class="connection-name">${c.name}</span>
+                    <span class="connection-rel">${c.rel_type}</span>
+                </div>`;
+            });
+            html += `</div>`;
+        }
+
+        // Timeline
+        if (card.timeline && card.timeline.length > 0) {
+            html += `<div class="card-section"><div class="card-section-title">Timeline</div>`;
+            card.timeline.forEach(t => {
+                html += `<div class="card-timeline-item">
+                    <span class="card-tl-date">${t.date || '--'}</span>
+                    <span class="card-tl-desc">${t.doc_type ? `[${t.doc_type.toUpperCase()}] ` : ''}${t.description || ''}</span>
+                </div>`;
+            });
+            html += `</div>`;
+        }
+
+        dom.entityPanelBody.innerHTML = html;
+
+        // Bind connection clicks
+        dom.entityPanelBody.querySelectorAll('.connection-item').forEach(el => {
+            el.addEventListener('click', () => {
+                const id = parseInt(el.dataset.entityId, 10);
+                if (id) selectEntity(id);
+            });
+        });
+    }
+
+    function highlightEntityInGraph(entityId) {
+        if (state.currentView !== 'graph') return;
+        state.highlightedNodes.clear();
+        state.highlightedNodes.add(entityId);
+
+        // Also highlight direct neighbors
+        state.graphData.links.forEach(l => {
+            const s = typeof l.source === 'object' ? l.source.id : l.source;
+            const t = typeof l.target === 'object' ? l.target.id : l.target;
+            if (s === entityId) state.highlightedNodes.add(t);
+            if (t === entityId) state.highlightedNodes.add(s);
+        });
+
+        updateGraph();
+    }
+
+    function clearHighlight() {
+        state.highlightedNodes.clear();
+        updateGraph();
+    }
+
+    // -----------------------------------------------------------------
+    // Search & Autocomplete
+    // -----------------------------------------------------------------
+    function setupSearch() {
+        let acIndex = -1;
+        dom.searchInput.addEventListener('input', () => {
+            const q = dom.searchInput.value.trim().toLowerCase();
+            dom.searchClear.classList.toggle('visible', q.length > 0);
+            if (q.length < 2) {
+                dom.autocomplete.classList.remove('visible');
+                acIndex = -1;
+                return;
+            }
+            const matches = state.graphData.nodes
+                .filter(n => {
+                    if (n.name.toLowerCase().includes(q)) return true;
+                    if (n.aliases && n.aliases.some(a => a.toLowerCase().includes(q))) return true;
+                    return false;
+                })
+                .sort((a, b) => (b.score || 0) - (a.score || 0))
+                .slice(0, 15);
+
+            dom.autocomplete.innerHTML = '';
+            if (matches.length === 0) {
+                dom.autocomplete.classList.remove('visible');
+                return;
+            }
+
+            matches.forEach((m, i) => {
+                const div = document.createElement('div');
+                div.className = 'autocomplete-item';
+                div.innerHTML = `
+                    <span class="ac-score" style="background:${scoreColor(m.score || 0)}"></span>
+                    <span class="ac-name">${m.name}</span>
+                    <span class="ac-type">${m.type}</span>`;
+                div.addEventListener('click', () => {
+                    selectEntity(m.id);
+                    dom.searchInput.value = m.name;
+                    dom.autocomplete.classList.remove('visible');
+                    focusOnNode(m.id);
+                });
+                dom.autocomplete.appendChild(div);
+            });
+            dom.autocomplete.classList.add('visible');
+            acIndex = -1;
+        });
+
+        // Keyboard navigation in autocomplete
+        dom.searchInput.addEventListener('keydown', (e) => {
+            const items = dom.autocomplete.querySelectorAll('.autocomplete-item');
+            if (!items.length) return;
+            if (e.key === 'ArrowDown') {
+                e.preventDefault();
+                acIndex = Math.min(acIndex + 1, items.length - 1);
+                items.forEach((it, i) => it.classList.toggle('active', i === acIndex));
+            } else if (e.key === 'ArrowUp') {
+                e.preventDefault();
+                acIndex = Math.max(acIndex - 1, 0);
+                items.forEach((it, i) => it.classList.toggle('active', i === acIndex));
+            } else if (e.key === 'Enter') {
+                e.preventDefault();
+                if (acIndex >= 0 && items[acIndex]) items[acIndex].click();
+            } else if (e.key === 'Escape') {
+                dom.autocomplete.classList.remove('visible');
+            }
+        });
+
+        dom.searchClear.addEventListener('click', () => {
+            dom.searchInput.value = '';
+            dom.searchClear.classList.remove('visible');
+            dom.autocomplete.classList.remove('visible');
+            clearHighlight();
+        });
+
+        // Close autocomplete on outside click
+        document.addEventListener('click', (e) => {
+            if (!e.target.closest('#search-container')) {
+                dom.autocomplete.classList.remove('visible');
+            }
+        });
+    }
+
+    function focusOnNode(nodeId) {
+        if (state.currentView !== 'graph' || !state.simulation) return;
+        const sim = state.simulation;
+        const node = sim.nodes().find(n => n.id === nodeId);
+        if (!node || node.x == null) return;
+
+        const svg = d3.select('#graph-svg');
+        const width = dom.graphContainer.clientWidth;
+        const height = dom.graphContainer.clientHeight;
+        const scale = 2;
+        const tx = width / 2 - node.x * scale;
+        const ty = height / 2 - node.y * scale;
+        svg.transition().duration(600).call(
+            zoomBehavior.transform,
+            d3.zoomIdentity.translate(tx, ty).scale(scale)
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // View Switching
+    // -----------------------------------------------------------------
+    function switchView(view) {
+        state.currentView = view;
+        dom.statView.textContent = view === 'graph' ? '2D Graph' : view === '3d' ? '3D View' : 'Timeline';
+
+        // Toggle containers
+        dom.graphContainer.style.display = view === 'graph' ? 'block' : 'none';
+        dom.threeContainer.style.display = view === '3d' ? 'block' : 'none';
+        dom.timelineContainer.style.display = view === 'timeline' ? 'flex' : 'none';
+
+        // Update buttons
+        document.querySelectorAll('#view-mode-group .view-btn').forEach(btn => {
+            btn.classList.toggle('active', btn.dataset.view === view);
+        });
+
+        if (view === 'graph') {
+            destroy3DView();
+            updateGraph();
+        } else if (view === '3d') {
+            init3DView();
+        } else if (view === 'timeline') {
+            destroy3DView();
+            renderTimeline();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Export PNG
+    // -----------------------------------------------------------------
+    function exportPNG() {
+        if (state.currentView === 'graph') {
+            const svg = document.getElementById('graph-svg');
+            const serializer = new XMLSerializer();
+            let source = serializer.serializeToString(svg);
+
+            // Inline computed styles
+            const css = document.querySelector('style').textContent;
+            source = source.replace('</svg>', `<style>${css}</style></svg>`);
+
+            const blob = new Blob([source], { type: 'image/svg+xml;charset=utf-8' });
+            const url = URL.createObjectURL(blob);
+
+            // Convert SVG to PNG via canvas
+            const img = new Image();
+            img.onload = () => {
+                const canvas = document.createElement('canvas');
+                canvas.width = svg.clientWidth * 2;
+                canvas.height = svg.clientHeight * 2;
+                const ctx = canvas.getContext('2d');
+                ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--bg-primary');
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+                canvas.toBlob((pngBlob) => {
+                    const a = document.createElement('a');
+                    a.href = URL.createObjectURL(pngBlob);
+                    a.download = `evidence-board-${new Date().toISOString().slice(0, 10)}.png`;
+                    a.click();
+                    URL.revokeObjectURL(a.href);
+                }, 'image/png');
+                URL.revokeObjectURL(url);
+            };
+            img.src = url;
+        } else if (state.currentView === '3d' && state.threeScene) {
+            state.threeScene.renderer.render(state.threeScene.scene, state.threeScene.camera);
+            const dataURL = state.threeScene.renderer.domElement.toDataURL('image/png');
+            const a = document.createElement('a');
+            a.href = dataURL;
+            a.download = `evidence-board-3d-${new Date().toISOString().slice(0, 10)}.png`;
+            a.click();
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Theme Toggle
+    // -----------------------------------------------------------------
+    function toggleTheme() {
+        document.documentElement.classList.toggle('light-theme');
+        if (state.threeScene) {
+            const isLight = document.documentElement.classList.contains('light-theme');
+            state.threeScene.scene.background = new THREE.Color(isLight ? 0xf3f4f6 : 0x0a0e17);
+            state.threeScene.scene.fog.color = new THREE.Color(isLight ? 0xf3f4f6 : 0x0a0e17);
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Event Binding
+    // -----------------------------------------------------------------
+    function bindEvents() {
+        // View mode buttons
+        document.querySelectorAll('#view-mode-group .view-btn').forEach(btn => {
+            btn.addEventListener('click', () => switchView(btn.dataset.view));
+        });
+
+        // Filter panel toggle
+        document.getElementById('btn-toggle-filters').addEventListener('click', () => {
+            dom.filterPanel.classList.toggle('collapsed');
+        });
+
+        // Entity panel close
+        dom.entityPanelClose.addEventListener('click', () => {
+            dom.entityPanel.classList.remove('open');
+            state.selectedEntityId = null;
+            clearHighlight();
+        });
+
+        // Export PNG
+        document.getElementById('btn-export-png').addEventListener('click', exportPNG);
+
+        // Toggle labels
+        document.getElementById('btn-toggle-labels').addEventListener('click', () => {
+            state.showLabels = !state.showLabels;
+            document.getElementById('opt-show-labels').checked = state.showLabels;
+            updateGraph();
+        });
+
+        // Label checkbox in filter panel
+        document.getElementById('opt-show-labels').addEventListener('change', (e) => {
+            state.showLabels = e.target.checked;
+            updateGraph();
+        });
+
+        // Edge label checkbox
+        document.getElementById('opt-show-edge-labels').addEventListener('change', (e) => {
+            state.showEdgeLabels = e.target.checked;
+            updateGraph();
+        });
+
+        // Inferred links checkbox
+        document.getElementById('opt-show-inferred').addEventListener('change', (e) => {
+            state.showInferred = e.target.checked;
+            updateGraph();
+        });
+
+        // Theme toggle
+        document.getElementById('btn-theme-toggle').addEventListener('click', toggleTheme);
+
+        // Click on graph background to deselect
+        dom.graphSvg.addEventListener('click', (e) => {
+            if (e.target === dom.graphSvg || e.target.tagName === 'svg') {
+                dom.entityPanel.classList.remove('open');
+                state.selectedEntityId = null;
+                clearHighlight();
+            }
+        });
+
+        // Window resize
+        window.addEventListener('resize', () => {
+            if (state.currentView === 'graph') {
+                const width = dom.graphContainer.clientWidth;
+                const height = dom.graphContainer.clientHeight;
+                d3.select('#graph-svg').attr('viewBox', [0, 0, width, height]);
+            }
+        });
+
+        // Timeline filters
+        bindTimelineFilters();
+    }
+
+    // -----------------------------------------------------------------
+    // Initialization
+    // -----------------------------------------------------------------
+    async function init() {
+        try {
+            await loadData();
+            buildFilters();
+            setupSearch();
+            bindEvents();
+            initGraph();
+
+            // Show data info or placeholder message
+            if (state.graphData.metadata?.placeholder) {
+                dom.errorBanner.textContent =
+                    'No data files found. Run the exporter to generate data: python -m export.exporter viewer';
+                dom.errorBanner.classList.add('visible');
+            }
+
+            // Hide loading
+            setTimeout(() => {
+                dom.loading.classList.add('hidden');
+            }, 300);
+
+        } catch (err) {
+            console.error('Initialization failed:', err);
+            dom.loadingText.textContent = 'Failed to load: ' + err.message;
+        }
+    }
+
+    // Start
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', init);
+    } else {
+        init();
+    }
+
+})();
+</script>
+</body>
+</html>

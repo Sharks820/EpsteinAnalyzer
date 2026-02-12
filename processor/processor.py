@@ -715,9 +715,16 @@ class RedactionForensics:
         """Strip PDF layers and look for content under the redaction layer."""
         try:
             page = doc[page_idx]
-            # Get raw page content stream
-            xref = page.xref
-            page_content = doc.xref_stream(xref) if xref else None
+            # Get raw page content stream(s) via /Contents references
+            contents_xrefs = page.get_contents()
+            page_content = None
+            if contents_xrefs:
+                streams = []
+                for cx in contents_xrefs:
+                    s = doc.xref_stream(cx)
+                    if s:
+                        streams.append(s)
+                page_content = b"".join(streams) if streams else None
             if not page_content:
                 return None
 
@@ -1615,6 +1622,14 @@ class EmailChainStitcher:
                     except Exception:
                         continue
 
+            # Shift existing messages at or after the insertion point
+            if position <= len(existing):
+                conn.execute(
+                    "UPDATE email_messages SET position_in_chain = position_in_chain + 1 "
+                    "WHERE chain_id = ? AND position_in_chain >= ?",
+                    (chain_id, position),
+                )
+
             conn.execute(
                 """INSERT INTO email_messages
                    (chain_id, document_id, position_in_chain,
@@ -1792,8 +1807,8 @@ class EmailChainStitcher:
             "%d-%b-%y",
         ]
 
-        # Strip timezone abbreviations like "EST", "PST" before parsing
-        cleaned = re.sub(r"\s+\(?[A-Z]{2,5}\)?\s*$", "", date_str)
+        # Strip timezone abbreviations like "EST", "PST" but preserve AM/PM
+        cleaned = re.sub(r"\s+\(?(?!(?:AM|PM)\b)[A-Z]{2,5}\)?\s*$", "", date_str)
 
         for fmt in formats:
             try:

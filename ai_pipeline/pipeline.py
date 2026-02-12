@@ -323,7 +323,7 @@ class CodexRunner(ModelRunner):
 
     def _build_command(self, prompt_file: str) -> list[str]:
         # Reads from stdin (file handle passed by run()); no shell piping needed
-        return ["codex", "exec"]
+        return ["codex"]
 
 
 class GeminiRunner(ModelRunner):

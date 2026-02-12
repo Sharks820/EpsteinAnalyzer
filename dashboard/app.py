@@ -702,7 +702,7 @@ DOCUMENT_VIEWER_HTML = r"""{% extends "base.html" %}
       {% for ann in annotations %}
       <div class="annotation">
         <div class="an-label">Page {{ ann.page }} &middot; Para {{ ann.para }}</div>
-        <div>{{ ann.html|safe }}</div>
+        <div>{{ ann.html|e }}</div>
       </div>
       {% endfor %}
       {% endif %}
@@ -982,14 +982,23 @@ def entities_list():
         conditions.append("e.entity_type = ?")
         params.append(filter_type)
     if min_score:
-        conditions.append("COALESCE(e.user_score, e.implication_score) >= ?")
-        params.append(float(min_score))
+        try:
+            conditions.append("COALESCE(e.user_score, e.implication_score) >= ?")
+            params.append(float(min_score))
+        except (ValueError, TypeError):
+            pass
     if max_score:
-        conditions.append("COALESCE(e.user_score, e.implication_score) <= ?")
-        params.append(float(max_score))
+        try:
+            conditions.append("COALESCE(e.user_score, e.implication_score) <= ?")
+            params.append(float(max_score))
+        except (ValueError, TypeError):
+            pass
     if filter_dataset:
-        conditions.append("e.first_seen_dataset = ?")
-        params.append(int(filter_dataset))
+        try:
+            conditions.append("e.first_seen_dataset = ?")
+            params.append(int(filter_dataset))
+        except (ValueError, TypeError):
+            pass
 
     where = " AND ".join(conditions) if conditions else "1=1"
     sql = f"""
@@ -2307,12 +2316,6 @@ def handle_connect():
 #  Template registration (so {% extends "base.html" %} works)
 # ============================================================================
 
-@app.before_request
-def _register_base_template():
-    """Register the base template so child templates can extend it."""
-    app.jinja_env.loader = _OverlayLoader(app.jinja_env.loader)
-
-
 class _OverlayLoader:
     """A Jinja2 loader that serves our inline base template and delegates the rest."""
 
@@ -2335,6 +2338,10 @@ class _OverlayLoader:
     # Jinja2 requires these for compatibility
     def __getattr__(self, name):
         return getattr(self._inner, name)
+
+
+# Register overlay loader once at import time (not per-request)
+app.jinja_env.loader = _OverlayLoader(app.jinja_env.loader)
 
 
 # ============================================================================
