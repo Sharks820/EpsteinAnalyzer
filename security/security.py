@@ -104,11 +104,17 @@ class EncryptionManager:
             with open(output_path, "wb") as fout:
                 while True:
                     ct_len_bytes = fin.read(4)
-                    if not ct_len_bytes or len(ct_len_bytes) < 4:
-                        break
+                    if not ct_len_bytes:
+                        break  # Clean EOF at chunk boundary
+                    if len(ct_len_bytes) < 4:
+                        raise ValueError("Corrupted encrypted file: truncated chunk header")
                     ct_len = int.from_bytes(ct_len_bytes, "big")
                     nonce = fin.read(self.NONCE_SIZE)
+                    if len(nonce) < self.NONCE_SIZE:
+                        raise ValueError("Corrupted encrypted file: truncated nonce")
                     ct = fin.read(ct_len)
+                    if len(ct) < ct_len:
+                        raise ValueError("Corrupted encrypted file: truncated ciphertext")
                     plaintext = aesgcm.decrypt(nonce, ct, None)
                     fout.write(plaintext)
         return output_path
@@ -305,6 +311,9 @@ class BackupManager:
                 last_backup_time = datetime.fromisoformat(
                     last_backup_file.read_text().strip()
                 )
+                # Ensure timezone-aware for comparison with mod_time
+                if last_backup_time.tzinfo is None:
+                    last_backup_time = last_backup_time.replace(tzinfo=timezone.utc)
 
         # Resolve dirs to skip during traversal
         backup_dir_resolved = backup_dir.resolve()
