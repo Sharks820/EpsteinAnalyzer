@@ -1119,7 +1119,7 @@ class PatternDetector:
             rows = conn.execute(
                 """SELECT e.id, e.name, e.entity_type,
                           COUNT(DISTINCT edl.document_id) AS total_docs,
-                          SUM(CASE WHEN dp.has_redactions = 1 THEN 1 ELSE 0 END) AS redacted_docs,
+                          COUNT(DISTINCT CASE WHEN dp.has_redactions = 1 THEN edl.document_id END) AS redacted_docs,
                           COALESCE(SUM(dp.redaction_count), 0) AS total_redactions
                    FROM entities e
                    JOIN entity_document_links edl ON edl.entity_id = e.id

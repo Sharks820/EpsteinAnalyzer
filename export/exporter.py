@@ -1699,7 +1699,8 @@ class ImageRedactionExporter:
                 """SELECT id FROM images
                    WHERE recovery_successful = 1
                      AND (quarantined = 0 OR quarantined IS NULL)
-                     AND user_reviewed = 1"""
+                     AND user_reviewed = 1
+                     AND user_decision IN ('save', 'save_redacted', 'flagged')"""
             ).fetchall()
         finally:
             conn.close()

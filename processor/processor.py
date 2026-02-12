@@ -17,6 +17,7 @@ import os
 import re
 import sys
 import time
+import urllib.parse
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
@@ -981,10 +982,8 @@ class RedactionForensics:
                 return None
 
             for search_text in search_parts:
-                # Escape FTS5 special characters
+                # Escape FTS5 special characters for phrase query
                 safe = search_text.replace('"', '""')
-                # Escape LIKE wildcard characters to prevent injection
-                safe = safe.replace("%", r"\%").replace("_", r"\_")
                 # Limit search length
                 if len(safe) > 40:
                     safe = safe[:40]
@@ -993,10 +992,11 @@ class RedactionForensics:
                     rows = conn.execute(
                         """SELECT dp.text_content, dp.document_id, dp.page_number
                            FROM document_pages dp
-                           WHERE dp.document_id != ?
-                             AND dp.text_content LIKE ? ESCAPE '\'
+                           JOIN document_text_fts fts ON dp.rowid = fts.rowid
+                           WHERE document_text_fts MATCH ?
+                             AND dp.document_id != ?
                            LIMIT 5""",
-                        (current_doc_id, f"%{safe}%"),
+                        (f'"{safe}"', current_doc_id),
                     ).fetchall()
                 except Exception:
                     continue
@@ -1855,6 +1855,8 @@ class EmailChainStitcher:
         for fmt in formats:
             try:
                 dt = datetime.strptime(cleaned, fmt)
+                if dt.tzinfo is not None:
+                    dt = dt.astimezone(timezone.utc)
                 return dt.replace(tzinfo=None)  # normalize to naive UTC
             except ValueError:
                 continue
@@ -2278,6 +2280,8 @@ class ProcessorEngine:
             document_id = self._ensure_document(file_path, dataset_id)
         result["document_id"] = document_id
 
+        had_errors = False
+
         # --- 1. OCR ---
         self._notify("Starting OCR...")
         try:
@@ -2292,6 +2296,7 @@ class ProcessorEngine:
             log.error("OCR failed: %s", exc)
             result["stages"]["ocr"] = {"error": str(exc)}
             page_results = []
+            had_errors = True
 
         # Combine all text
         full_text = "\n".join(p.get("text_content", "") or "" for p in page_results)
@@ -2320,6 +2325,7 @@ class ProcessorEngine:
             classification = {"doc_type": "unknown"}
             doc_type = "unknown"
             result["stages"]["classify"] = {"error": str(exc)}
+            had_errors = True
 
         # --- 3. Redaction Forensics ---
         self._notify("Running redaction forensics...")
@@ -2335,6 +2341,7 @@ class ProcessorEngine:
         except Exception as exc:
             log.error("Redaction forensics failed: %s", exc)
             result["stages"]["redaction_forensics"] = {"error": str(exc)}
+            had_errors = True
 
         # --- 4. Image Forensics ---
         self._notify("Running image forensics...")
@@ -2351,6 +2358,7 @@ class ProcessorEngine:
         except Exception as exc:
             log.error("Image forensics failed: %s", exc)
             result["stages"]["image_forensics"] = {"error": str(exc)}
+            had_errors = True
 
         # --- 5. Entity Extraction ---
         self._notify("Extracting entities...")
@@ -2365,6 +2373,7 @@ class ProcessorEngine:
         except Exception as exc:
             log.error("Entity extraction failed: %s", exc)
             result["stages"]["entity_extraction"] = {"error": str(exc)}
+            had_errors = True
 
         # --- 6. Email Chain Stitching (only for emails) ---
         if doc_type == "email" and classification.get("email_data"):
@@ -2377,6 +2386,14 @@ class ProcessorEngine:
             except Exception as exc:
                 log.error("Email chain stitching failed: %s", exc)
                 result["stages"]["email_chain"] = {"error": str(exc)}
+                had_errors = True
+
+            # Update entity mention_type for email senders/recipients
+            try:
+                edata = classification["email_data"]
+                self._tag_email_entity_roles(edata, document_id)
+            except Exception as exc:
+                log.debug("Email entity role tagging failed: %s", exc)
 
         # --- 7. Priority Scoring ---
         self._notify("Calculating priority score...")
@@ -2386,6 +2403,7 @@ class ProcessorEngine:
         except Exception as exc:
             log.error("Priority scoring failed: %s", exc)
             result["stages"]["priority_score"] = {"error": str(exc)}
+            had_errors = True
 
         # --- mark complete ---
         elapsed = round(time.time() - t_start, 2)
@@ -2393,19 +2411,27 @@ class ProcessorEngine:
 
         conn = self.db.get_connection()
         try:
-            conn.execute(
-                """UPDATE documents
-                   SET analysis_completed = 1, status = 'analyzed', updated_at = ?
-                   WHERE id = ?""",
-                (datetime.now(tz=timezone.utc).isoformat(), document_id),
-            )
+            if had_errors:
+                conn.execute(
+                    """UPDATE documents
+                       SET status = 'error', updated_at = ?
+                       WHERE id = ?""",
+                    (datetime.now(tz=timezone.utc).isoformat(), document_id),
+                )
+            else:
+                conn.execute(
+                    """UPDATE documents
+                       SET analysis_completed = 1, status = 'analyzed', updated_at = ?
+                       WHERE id = ?""",
+                    (datetime.now(tz=timezone.utc).isoformat(), document_id),
+                )
             conn.commit()
         finally:
             conn.close()
 
         self.db.log_action(
             "process_document",
-            f"Processed doc_id={document_id} in {elapsed}s, priority={result['stages'].get('priority_score', '?')}",
+            f"Processed doc_id={document_id} in {elapsed}s, errors={had_errors}, priority={result['stages'].get('priority_score', '?')}",
             user_initiated=False,
         )
 
@@ -2511,9 +2537,15 @@ class ProcessorEngine:
         conn = self.db.get_connection()
         try:
             existing = conn.execute(
-                "SELECT id FROM documents WHERE file_hash = ?", (file_hash,)
+                "SELECT id, file_path FROM documents WHERE file_hash = ?", (file_hash,)
             ).fetchone()
             if existing:
+                if existing["file_path"] != file_path:
+                    conn.execute(
+                        "UPDATE documents SET file_path = ? WHERE id = ?",
+                        (file_path, existing["id"]),
+                    )
+                    conn.commit()
                 return existing["id"]
 
             # Determine file type
@@ -2546,6 +2578,43 @@ class ProcessorEngine:
             )
             conn.commit()
             return cursor.lastrowid
+        finally:
+            conn.close()
+
+    # ------------------------------------------------------------------
+    def _tag_email_entity_roles(self, email_data: Dict, document_id: int):
+        """Update entity_document_links mention_type for email sender/recipients."""
+        from_name = (email_data.get("from_name") or "").upper().strip()
+        from_addr = (email_data.get("from_address") or "").upper().strip()
+        to_raw = email_data.get("to", [])
+        cc_raw = email_data.get("cc", [])
+
+        recipient_names: set[str] = set()
+        for addr_str in to_raw + cc_raw:
+            recipient_names.add(addr_str.upper().strip())
+
+        conn = self.db.get_connection()
+        try:
+            links = conn.execute(
+                """SELECT edl.id, e.canonical_name
+                   FROM entity_document_links edl
+                   JOIN entities e ON e.id = edl.entity_id
+                   WHERE edl.document_id = ? AND edl.mention_type = 'mentioned'""",
+                (document_id,),
+            ).fetchall()
+            for link in links:
+                cname = link["canonical_name"]
+                if cname and (cname == from_name or cname == from_addr):
+                    conn.execute(
+                        "UPDATE entity_document_links SET mention_type = 'author' WHERE id = ?",
+                        (link["id"],),
+                    )
+                elif cname and any(cname in rn for rn in recipient_names):
+                    conn.execute(
+                        "UPDATE entity_document_links SET mention_type = 'recipient' WHERE id = ?",
+                        (link["id"],),
+                    )
+            conn.commit()
         finally:
             conn.close()
 

@@ -125,7 +125,11 @@ class DatabaseManager:
 
         for f in queue_dir.rglob("*"):
             if f.is_file():
-                file_hash = hashlib.sha256(f.read_bytes()).hexdigest()
+                h = hashlib.sha256()
+                with open(f, "rb") as fh:
+                    while chunk := fh.read(65536):
+                        h.update(chunk)
+                file_hash = h.hexdigest()
                 if file_hash in analyzed_hashes:
                     size = f.stat().st_size
                     f.unlink()
@@ -202,6 +206,7 @@ class DatabaseManager:
             stats = {k: row[k] for k in row.keys()}
             disk = self._get_cached_disk_usage()
             stats["disk_usage_gb"] = disk["total_gb"]
+            stats["disk_max_gb"] = disk["max_gb"]
             stats["disk_usage_percent"] = disk["usage_percent"]
             stats["needs_compact"] = disk["needs_compact"]
             return stats

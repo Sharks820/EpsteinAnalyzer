@@ -331,7 +331,7 @@ class ModelRunner(ABC):
 
 
 class CodexRunner(ModelRunner):
-    """Runs prompts through the Codex CLI."""
+    """Runs prompts through the Codex CLI (codex exec for non-interactive)."""
 
     def __init__(self, timeout: int = 300):
         super().__init__("codex", timeout)
@@ -340,8 +340,9 @@ class CodexRunner(ModelRunner):
         return "codex"
 
     def _build_command(self, prompt_file: str) -> list[str]:
-        # Reads from stdin (file handle passed by run()); no shell piping needed
-        return ["codex"]
+        # codex exec reads from stdin when prompt is "-"
+        # -C sets working dir to project root (codex requires a git repo)
+        return ["codex", "exec", "-C", str(_PROJECT_ROOT), "-"]
 
 
 class GeminiRunner(ModelRunner):
@@ -380,7 +381,9 @@ class KimiRunner(ModelRunner):
         return "kimi"
 
     def _build_command(self, prompt_file: str) -> list[str]:
-        return ["kimi", "--quiet", "--model", "k2.5"]
+        # --quiet = --print --output-format text --final-message-only
+        # Uses default model from ~/.kimi/config.toml (kimi-code/kimi-for-coding)
+        return ["kimi", "--quiet"]
 
 
 # ===================================================================
@@ -636,7 +639,7 @@ class ResponseParser:
 class ConsensusEngine:
     """Merges analyses from multiple models into a consensus result."""
 
-    FULL_AGREEMENT = "full_agreement"
+    FULL_AGREEMENT = "full"
     MAJORITY = "majority"
     SPLIT = "split"
     SINGLE_SOURCE = "single_source"
@@ -1462,16 +1465,20 @@ class PipelineEngine:
                     VALUES (?, ?, ?, ?, ?, 1, ?, ?, ?)
                 """, (name, etype, canonical, google_url, role, document_id, now, now))
 
-                # Whether INSERT succeeded or was ignored, fetch the ID and bump count
+                inserted_new = conn.execute("SELECT changes()").fetchone()[0] > 0
+
                 existing = conn.execute(
                     "SELECT id FROM entities WHERE canonical_name = ? AND entity_type = ?",
                     (canonical, etype),
                 ).fetchone()
                 eid = existing["id"]
-                conn.execute(
-                    "UPDATE entities SET document_count = document_count + 1, updated_at = ? WHERE id = ?",
-                    (now, eid),
-                )
+
+                # Only bump count for existing entities (new ones already have count=1)
+                if not inserted_new:
+                    conn.execute(
+                        "UPDATE entities SET document_count = document_count + 1, updated_at = ? WHERE id = ?",
+                        (now, eid),
+                    )
 
                 entity_id_map[canonical.lower()] = eid
 
@@ -1542,25 +1549,28 @@ class PipelineEngine:
 
             # --- Redaction inferences ---
             redact_list = consensus.get("redaction_inferences") or []
+            # Pre-fetch ordered redaction IDs for stable index-based lookup
+            redaction_rows = conn.execute(
+                "SELECT id FROM redactions WHERE document_id = ? ORDER BY page_number, id",
+                (document_id,)
+            ).fetchall()
+            redaction_ids = [r["id"] for r in redaction_rows]
             for ri in redact_list:
                 if not isinstance(ri, dict):
                     continue
                 candidates = ri.get("candidates", [])
                 if candidates:
                     ai_candidates_json = json.dumps(candidates, default=str)
-                    # Update any matching redaction record for this document
-                    # AI indices are 1-based (REDACTION #1, #2, ...), OFFSET is 0-based
-                    offset = max(0, ri.get("index", 1) - 1)
-                    conn.execute("""
-                        UPDATE redactions
-                        SET ai_candidates = ?,
-                            status = CASE WHEN status = 'unresolved' THEN 'inferred' ELSE status END,
-                            updated_at = ?
-                        WHERE document_id = ? AND id IN (
-                            SELECT id FROM redactions WHERE document_id = ?
-                            ORDER BY id LIMIT 1 OFFSET ?
-                        )
-                    """, (ai_candidates_json, now, document_id, document_id, offset))
+                    # AI indices are 1-based (REDACTION #1, #2, ...)
+                    idx = ri.get("index", 1) - 1
+                    if 0 <= idx < len(redaction_ids):
+                        conn.execute("""
+                            UPDATE redactions
+                            SET ai_candidates = ?,
+                                status = CASE WHEN status = 'unresolved' THEN 'inferred' ELSE status END,
+                                updated_at = ?
+                            WHERE id = ?
+                        """, (ai_candidates_json, now, redaction_ids[idx]))
 
             conn.commit()
             logger.info("Knowledge graph updated for document %d (%d entities, %d connections)",

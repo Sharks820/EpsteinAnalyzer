@@ -263,11 +263,11 @@ CREATE INDEX IF NOT EXISTS idx_rel_weight ON relationships(weight DESC);
 
 CREATE TABLE IF NOT EXISTS entity_document_links (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
-    entity_id INTEGER NOT NULL REFERENCES entities(id),
-    document_id INTEGER NOT NULL REFERENCES documents(id),
-    page_number INTEGER,
+    entity_id INTEGER NOT NULL REFERENCES entities(id) ON DELETE CASCADE,
+    document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+    page_number INTEGER DEFAULT 0 NOT NULL,
     context_snippet TEXT,  -- Text around where entity appears
-    mention_type TEXT,  -- 'author', 'recipient', 'mentioned', 'subject', 'witness'
+    mention_type TEXT DEFAULT 'mentioned' NOT NULL,  -- 'author', 'recipient', 'mentioned', 'subject', 'witness'
     -- Evidence scoring
     damning_score INTEGER DEFAULT 0,
     user_damning_score INTEGER,
@@ -497,4 +497,4 @@ CREATE TABLE IF NOT EXISTS removed_files (
 
 CREATE INDEX IF NOT EXISTS idx_removed_recovered ON removed_files(recovered);
 CREATE INDEX IF NOT EXISTS idx_removed_priority ON removed_files(priority);
-CREATE INDEX IF NOT EXISTS idx_removed_url ON removed_files(original_url);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_removed_url ON removed_files(original_url);

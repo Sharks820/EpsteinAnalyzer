@@ -341,7 +341,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
     <div class="sidebar-footer">
       Disk: {{ disk_pct }}% of {{ disk_max_gb }} GB<br>
       <div class="progress mt-1" style="margin-top:6px">
-        <div class="progress-bar {% if disk_pct > 78 %}orange{% elif disk_pct > 90 %}red{% else %}green{% endif %}"
+        <div class="progress-bar {% if disk_pct > 90 %}red{% elif disk_pct > 78 %}orange{% else %}green{% endif %}"
              style="width:{{ disk_pct }}%"></div>
       </div>
     </div>
@@ -400,7 +400,7 @@ def inject_sidebar_data():
         "pending_images": stats.get("pending_image_reviews", 0),
         "pending_deletions": stats.get("pending_deletions", 0),
         "disk_pct": stats.get("disk_usage_percent", 0),
-        "disk_max_gb": stats.get("disk_usage_gb", 0),
+        "disk_max_gb": stats.get("disk_max_gb", 0),
     }
 
 
@@ -882,7 +882,7 @@ def document_viewer(doc_id):
                     }
                     css = css_map.get(etype, "hl-person")
                     link = f'<a href="/entity/{int(el["entity_id"])}" class="{css}">{safe_name}</a>'
-                    highlighted = highlighted.replace(safe_name, link, 1)
+                    highlighted = highlighted.replace(safe_name, link)
             annotations.append({
                 "page": page["page_number"],
                 "para": j + 1,
@@ -1085,7 +1085,7 @@ def entities_list():
         filter_type=filter_type,
         min_score=min_score,
         max_score=max_score,
-        filter_dataset=int(filter_dataset) if filter_dataset else None,
+        filter_dataset=int(filter_dataset) if filter_dataset and filter_dataset.isdigit() else None,
     )
 
 
@@ -2039,7 +2039,11 @@ def export_reddit():
     if not finding_id:
         return redirect(url_for("export_tools"))
 
-    finding = query_one("SELECT * FROM findings WHERE id = ?", (int(finding_id),))
+    try:
+        fid = int(finding_id)
+    except (ValueError, TypeError):
+        return redirect(url_for("export_tools"))
+    finding = query_one("SELECT * FROM findings WHERE id = ?", (fid,))
     if not finding:
         return redirect(url_for("export_tools"))
 
@@ -2149,7 +2153,10 @@ def export_report():
 
 @app.route("/export/public", methods=["POST"])
 def export_public():
-    min_score = int(request.form.get("min_score", 50))
+    try:
+        min_score = int(request.form.get("min_score", 50))
+    except (ValueError, TypeError):
+        min_score = 50
     entities = query_all(
         "SELECT name, canonical_name, entity_type, implication_score, evidence_count FROM entities WHERE implication_score >= ? AND is_victim = 0 ORDER BY implication_score DESC",
         (min_score,),
@@ -2346,7 +2353,10 @@ AUDIT_HTML = r"""{% extends "base.html" %}
 
 @app.route("/audit")
 def audit_page():
-    page = max(1, int(request.args.get("page", 1)))
+    try:
+        page = max(1, int(request.args.get("page", 1)))
+    except (ValueError, TypeError):
+        page = 1
     per_page = 50
     filter_action = request.args.get("action", "").strip()
     filter_source = request.args.get("source", "").strip()

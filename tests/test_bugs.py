@@ -854,10 +854,11 @@ class TestDeadImports:
         # Should not have standalone 'import struct'
         assert not re.search(r"^import struct\s*$", source, re.MULTILINE)
 
-    def test_no_urllib_parse_import(self):
+    def test_urllib_parse_imported(self):
+        """urllib.parse must be imported — it's used by _google_search_url / _wikipedia_url."""
         proc_path = Path(__file__).parent.parent / "processor" / "processor.py"
         source = proc_path.read_text(encoding="utf-8")
-        assert not re.search(r"^import urllib\.parse\s*$", source, re.MULTILINE)
+        assert re.search(r"^import urllib\.parse\s*$", source, re.MULTILINE)
 
 
 # ============================================================================

@@ -643,20 +643,32 @@ class GitHubMirror(SourceModule):
         if not repo_url.startswith(("https://", "http://")):
             raise ValueError(f"Refusing to clone non-HTTP URL: {repo_url!r}")
         repo_name = repo_url.rstrip("/").split("/")[-1]
+        # Sanitize repo_name to prevent path traversal (e.g. "..%2F" or "..")
+        repo_name = repo_name.replace("\\", "").replace("/", "").replace("\0", "")
+        if not repo_name or repo_name in (".", ".."):
+            raise ValueError(f"Invalid repository name derived from URL: {repo_url!r}")
         local = dest / repo_name
         if (local / ".git").exists():
             self.logger.info("Pulling updates for %s", repo_name)
-            subprocess.run(
+            proc = subprocess.run(
                 ["git", "-C", str(local), "pull", "--ff-only"],
                 capture_output=True, timeout=300,
             )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"git pull failed (rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}"
+                )
         else:
             self.logger.info("Cloning %s", repo_url)
             local.mkdir(parents=True, exist_ok=True)
-            subprocess.run(
+            proc = subprocess.run(
                 ["git", "clone", "--depth", "1", repo_url, str(local)],
                 capture_output=True, timeout=600,
             )
+            if proc.returncode != 0:
+                raise RuntimeError(
+                    f"git clone failed (rc={proc.returncode}): {proc.stderr.decode(errors='replace').strip()}"
+                )
         return local
 
     # ------------------------------------------------------------------
