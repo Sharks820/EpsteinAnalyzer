@@ -191,6 +191,18 @@ def _download_file(
 
     resp = _request_with_retries(session, url, stream=True, headers=hdrs)
 
+    # Guard: reject HTML responses when we expect binary files (e.g. PDFs).
+    # The DOJ age-verification gate returns 200 + text/html instead of the
+    # real file if the justiceGovAgeVerified cookie is missing/expired.
+    ct = resp.headers.get("Content-Type", "")
+    if "text/html" in ct and not url.endswith((".html", ".htm")):
+        resp.close()
+        raise RuntimeError(
+            f"Server returned HTML instead of a file for {url} "
+            f"(Content-Type: {ct}). The age-verification cookie may "
+            f"have expired -- retry the download."
+        )
+
     # Server may not support Range -- if so, start from scratch
     if resume_pos > 0 and resp.status_code != 206:
         resume_pos = 0
@@ -381,6 +393,13 @@ class DOJScraper(SourceModule):
             "Sec-Fetch-User": "?1",
             "Upgrade-Insecure-Requests": "1",
         })
+
+        # DOJ age-verification gate: the site requires this cookie to
+        # serve actual file content instead of the age-verify redirect page.
+        self.session.cookies.set(
+            "justiceGovAgeVerified", "true",
+            domain=".justice.gov", path="/",
+        )
 
     # ------------------------------------------------------------------
     # Build dataset page URL
