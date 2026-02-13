@@ -5,6 +5,7 @@ Runs locally at http://127.0.0.1:8080
 """
 
 import html
+import jinja2
 import json
 import logging
 import os
@@ -2584,7 +2585,7 @@ def handle_connect():
 #  Template registration (so {% extends "base.html" %} works)
 # ============================================================================
 
-class _OverlayLoader:
+class _OverlayLoader(jinja2.BaseLoader):
     """A Jinja2 loader that serves our inline base template and delegates the rest."""
 
     def __init__(self, inner):
@@ -2595,17 +2596,13 @@ class _OverlayLoader:
             return (BASE_TEMPLATE, "base.html", lambda: True)
         if self._inner:
             return self._inner.get_source(environment, template)
-        raise Exception(f"Template not found: {template}")
+        raise jinja2.TemplateNotFound(template)
 
     def list_templates(self):
         templates = ["base.html"]
         if self._inner and hasattr(self._inner, "list_templates"):
             templates.extend(self._inner.list_templates())
         return templates
-
-    # Jinja2 requires these for compatibility
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
 
 
 # Register overlay loader once at import time (not per-request)
