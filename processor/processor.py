@@ -557,7 +557,12 @@ class RedactionForensics:
         page_results: Optional[List[Dict]] = None,
         progress_cb: Optional[Callable] = None,
     ) -> List[Dict[str, Any]]:
-        """Find redacted areas and run the 7-step recovery pipeline on each."""
+        """Find redacted areas and run the 11-step recovery pipeline on each.
+
+        Steps: 1=text_layer, 2=pdf_layer, 2.5=incremental_save, 3=metadata(deep),
+        4=ocr_mismatch, 4.5=rasterize_ocr, 5=copy_paste, 6=font_analysis,
+        6.5=char_width_estimation, 7=cross_document(enhanced), 8=ai_inference.
+        """
         pdf_path = str(pdf_path)
         all_redactions: List[Dict[str, Any]] = []
 
@@ -615,7 +620,14 @@ class RedactionForensics:
                             recovered_text, recovery_confidence = result
                             recovery_method = "pdf_layer"
 
-                    # Step 3: metadata_extraction
+                    # Step 2.5: incremental_save_recovery
+                    if not recovered_text and self.cfg.get("incremental_save_recovery", True):
+                        result = self._step2_5_incremental_save(doc, page_idx, fitz_rect)
+                        if result:
+                            recovered_text, recovery_confidence = result
+                            recovery_method = "incremental_save"
+
+                    # Step 3: metadata_extraction (deep)
                     if not recovered_text and self.cfg.get("metadata_extraction", True):
                         result = self._step3_metadata(doc, fitz_rect, page_idx)
                         if result:
@@ -628,6 +640,13 @@ class RedactionForensics:
                         if result:
                             recovered_text, recovery_confidence = result
                             recovery_method = "ocr_mismatch"
+
+                    # Step 4.5: rasterize_ocr
+                    if not recovered_text and self.cfg.get("rasterize_ocr", True):
+                        result = self._step4_5_rasterize_ocr(page, fitz_rect)
+                        if result:
+                            recovered_text, recovery_confidence = result
+                            recovery_method = "rasterize_ocr"
 
                     # Step 5: copy_paste_extraction
                     if not recovered_text and self.cfg.get("copy_paste_extraction", True):
@@ -643,14 +662,37 @@ class RedactionForensics:
                             recovered_text, recovery_confidence = result
                             recovery_method = "font_analysis"
 
-                    # Step 7: cross_document_matching
+                    # Step 6.5: char_width_estimation
+                    char_width_estimate = None
+                    if self.cfg.get("char_width_estimation", True):
+                        char_width_estimate = self._step6_5_char_width(
+                            doc, page_idx, fitz_rect
+                        )
+                        if not recovered_text and char_width_estimate:
+                            # Update estimated_chars with better estimate
+                            estimated_chars = char_width_estimate["estimated_chars"]
+
+                    # Step 7: cross_document_matching (enhanced)
                     if not recovered_text and self.cfg.get("cross_document_matching", True):
                         result = self._step7_cross_document(
-                            conn, context_before, context_after, document_id
+                            conn, context_before, context_after, document_id,
+                            expected_chars=estimated_chars,
                         )
                         if result:
                             recovered_text, recovery_confidence = result
                             recovery_method = "cross_document"
+
+                    # Step 8: ai_inference (last resort)
+                    ai_candidates = None
+                    if not recovered_text and self.cfg.get("ai_inference", True):
+                        ai_result = self._step8_ai_inference(
+                            context_before, context_after, estimated_chars,
+                            char_width_estimate, document_id,
+                        )
+                        if ai_result:
+                            recovered_text, recovery_confidence = ai_result["top_candidate"]
+                            recovery_method = "ai_inference"
+                            ai_candidates = json.dumps(ai_result.get("candidates", []))
 
                     is_recovered = recovered_text is not None and len(recovered_text.strip()) > 0
                     status = "recovered" if is_recovered else "unresolved"
@@ -671,6 +713,7 @@ class RedactionForensics:
                         "recovery_confidence": round(recovery_confidence, 4),
                         "is_recovered": is_recovered,
                         "status": status,
+                        "ai_candidates": ai_candidates,
                     }
 
                     conn.execute(
@@ -679,8 +722,8 @@ class RedactionForensics:
                             width, height, redaction_type, estimated_chars,
                             context_before, context_after,
                             recovery_method, recovered_text, recovery_confidence,
-                            is_recovered, status)
-                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                            is_recovered, status, ai_candidates)
+                           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                         (
                             document_id, page_num, rx, ry, rw, rh,
                             "text", estimated_chars,
@@ -691,6 +734,7 @@ class RedactionForensics:
                             round(recovery_confidence, 4),
                             int(is_recovered),
                             status,
+                            ai_candidates,
                         ),
                     )
                     all_redactions.append(redaction_record)
@@ -803,34 +847,72 @@ class RedactionForensics:
     def _step3_metadata(
         self, doc: fitz.Document, rect: fitz.Rect, page_idx: int
     ) -> Optional[Tuple[str, float]]:
-        """Check PDF metadata, properties, and revision history for hidden text."""
+        """Deep metadata mining: XMP, PieceInfo, Marked, EmbeddedFiles, revision history."""
         try:
-            metadata = doc.metadata
-            if not metadata:
-                return None
-
-            # Check if document has incremental saves (revision history)
-            # which might contain pre-redaction content
             xref_count = doc.xref_length()
             for xref_id in range(1, min(xref_count, 500)):
                 try:
                     obj_str = doc.xref_object(xref_id, compressed=False)
                     if not obj_str:
                         continue
-                    # Look for text stream references that might contain original content
+
+                    # Check /Contents and /Annot streams for pre-redaction content
                     if "/Contents" in obj_str or "/Annot" in obj_str:
                         stream = doc.xref_stream(xref_id)
                         if stream:
                             decoded = stream.decode("latin-1", errors="replace")
-                            # Check for readable text in the stream
                             readable = re.findall(r"\(([^)]{3,})\)", decoded)
                             if readable:
                                 combined = " ".join(readable)
                                 if len(combined.strip()) > 2:
                                     log.debug("Step 3 metadata recovery: [%d chars]", len(combined))
                                     return (combined.strip(), 0.6)
+
+                    # Check /PieceInfo and /Marked content for pre-redaction markers
+                    if "/PieceInfo" in obj_str or "/Marked" in obj_str:
+                        stream = doc.xref_stream(xref_id)
+                        if stream:
+                            decoded = stream.decode("latin-1", errors="replace")
+                            # PieceInfo may contain application-specific data with original text
+                            readable = re.findall(r"\(([^)]{3,})\)", decoded)
+                            if readable:
+                                combined = " ".join(readable)
+                                if len(combined.strip()) > 2:
+                                    log.debug("Step 3 PieceInfo recovery: [%d chars]", len(combined))
+                                    return (combined.strip(), 0.55)
+
+                    # Check /EmbeddedFiles for unredacted versions
+                    if "/EmbeddedFiles" in obj_str:
+                        stream = doc.xref_stream(xref_id)
+                        if stream:
+                            decoded = stream.decode("latin-1", errors="replace")
+                            readable = re.findall(r"\(([^)]{3,})\)", decoded)
+                            if readable:
+                                combined = " ".join(readable)
+                                if len(combined.strip()) > 2:
+                                    log.debug("Step 3 EmbeddedFile recovery: [%d chars]", len(combined))
+                                    return (combined.strip(), 0.65)
+
                 except Exception:
                     continue
+
+            # Parse XMP metadata streams for original content references
+            try:
+                xml_metadata = doc.get_xml_metadata()
+                if xml_metadata:
+                    # Look for description fields that might reference original content
+                    descriptions = re.findall(
+                        r"<dc:description[^>]*>(.*?)</dc:description>",
+                        xml_metadata, re.DOTALL,
+                    )
+                    for desc in descriptions:
+                        cleaned = re.sub(r"<[^>]+>", "", desc).strip()
+                        if cleaned and len(cleaned) > 5:
+                            log.debug("Step 3 XMP description: [%d chars]", len(cleaned))
+                            return (cleaned, 0.45)
+            except Exception:
+                pass
+
         except Exception as exc:
             log.debug("Step 3 error: %s", exc)
         return None
@@ -960,69 +1042,552 @@ class RedactionForensics:
         context_before: Optional[str],
         context_after: Optional[str],
         current_doc_id: int,
+        expected_chars: Optional[int] = None,
     ) -> Optional[Tuple[str, float]]:
-        """Search other documents for the same passage appearing unredacted."""
+        """Enhanced cross-document matching with multiple anchor lengths and scoring."""
         if not context_before and not context_after:
             return None
 
         try:
-            # Build search queries from context
-            search_parts = []
-            if context_before:
-                # Use last 60 chars of context_before as search anchor
-                anchor = context_before[-60:].strip()
-                if len(anchor) > 10:
-                    search_parts.append(anchor)
-            if context_after:
-                anchor = context_after[:60].strip()
-                if len(anchor) > 10:
-                    search_parts.append(anchor)
+            # Use multiple anchor lengths for better matching
+            anchor_lengths = [20, 40, 60]
+            candidates: List[Tuple[str, float]] = []  # (text, score)
 
-            if not search_parts:
-                return None
+            for anchor_len in anchor_lengths:
+                search_parts = []
+                if context_before:
+                    anchor = context_before[-anchor_len:].strip()
+                    if len(anchor) > 10:
+                        search_parts.append(anchor)
+                if context_after:
+                    anchor = context_after[:anchor_len].strip()
+                    if len(anchor) > 10:
+                        search_parts.append(anchor)
 
-            for search_text in search_parts:
-                # Escape FTS5 special characters for phrase query
-                safe = search_text.replace('"', '""')
-                # Limit search length
-                if len(safe) > 40:
-                    safe = safe[:40]
-
-                try:
-                    rows = conn.execute(
-                        """SELECT dp.text_content, dp.document_id, dp.page_number
-                           FROM document_pages dp
-                           JOIN document_text_fts fts ON dp.rowid = fts.rowid
-                           WHERE document_text_fts MATCH ?
-                             AND dp.document_id != ?
-                           LIMIT 5""",
-                        (f'"{safe}"', current_doc_id),
-                    ).fetchall()
-                except Exception:
+                if not search_parts:
                     continue
 
-                for row in rows:
-                    other_text = row["text_content"] or ""
-                    # Find the matching context and extract what appears between
-                    # context_before and context_after in the other document
-                    if context_before and context_after:
-                        before_anchor = context_before[-30:]
-                        after_anchor = context_after[:30]
-                        idx_before = other_text.find(before_anchor)
-                        idx_after = other_text.find(after_anchor)
-                        if idx_before >= 0 and idx_after > idx_before:
-                            start = idx_before + len(before_anchor)
-                            recovered = other_text[start:idx_after].strip()
-                            if recovered and len(recovered) > 0:
-                                log.debug(
-                                    "Step 7 cross-doc recovery from doc %d: [%d chars]",
-                                    row["document_id"],
-                                    len(recovered),
-                                )
-                                return (recovered, 0.8)
+                # Try AND query with both anchors first (most precise)
+                if len(search_parts) == 2:
+                    safe_parts = []
+                    for sp in search_parts:
+                        safe = sp.replace('"', '""')
+                        if len(safe) > anchor_len:
+                            safe = safe[:anchor_len]
+                        safe_parts.append(f'"{safe}"')
+                    combined_query = " AND ".join(safe_parts)
+                    try:
+                        rows = conn.execute(
+                            """SELECT dp.text_content, dp.document_id, dp.page_number
+                               FROM document_pages dp
+                               JOIN document_text_fts fts ON dp.rowid = fts.rowid
+                               WHERE document_text_fts MATCH ?
+                                 AND dp.document_id != ?
+                               LIMIT 5""",
+                            (combined_query, current_doc_id),
+                        ).fetchall()
+                        for row in rows:
+                            match = self._extract_between_anchors(
+                                row["text_content"] or "",
+                                context_before, context_after, expected_chars,
+                            )
+                            if match:
+                                candidates.append(match)
+                    except Exception:
+                        pass
+
+                # Fallback: individual anchor queries
+                for search_text in search_parts:
+                    safe = search_text.replace('"', '""')
+                    if len(safe) > anchor_len:
+                        safe = safe[:anchor_len]
+                    try:
+                        rows = conn.execute(
+                            """SELECT dp.text_content, dp.document_id, dp.page_number
+                               FROM document_pages dp
+                               JOIN document_text_fts fts ON dp.rowid = fts.rowid
+                               WHERE document_text_fts MATCH ?
+                                 AND dp.document_id != ?
+                               LIMIT 5""",
+                            (f'"{safe}"', current_doc_id),
+                        ).fetchall()
+                    except Exception:
+                        continue
+                    for row in rows:
+                        match = self._extract_between_anchors(
+                            row["text_content"] or "",
+                            context_before, context_after, expected_chars,
+                        )
+                        if match:
+                            candidates.append(match)
+
+            if candidates:
+                # Pick the best candidate by score
+                best = max(candidates, key=lambda x: x[1])
+                log.debug("Step 7 cross-doc recovery: [%d chars] (conf=%.2f)", len(best[0]), best[1])
+                return best
+
         except Exception as exc:
             log.debug("Step 7 error: %s", exc)
         return None
+
+    @staticmethod
+    def _extract_between_anchors(
+        other_text: str,
+        context_before: Optional[str],
+        context_after: Optional[str],
+        expected_chars: Optional[int] = None,
+    ) -> Optional[Tuple[str, float]]:
+        """Extract text between context anchors in another document, with scoring."""
+        if not (context_before and context_after):
+            return None
+
+        # Try multiple anchor lengths for finding the match
+        for trim in (30, 50, 80):
+            before_anchor = context_before[-trim:]
+            after_anchor = context_after[:trim]
+            idx_before = other_text.find(before_anchor)
+            idx_after = other_text.find(after_anchor, idx_before + len(before_anchor) if idx_before >= 0 else 0)
+
+            if idx_before >= 0 and idx_after > idx_before:
+                start = idx_before + len(before_anchor)
+                recovered = other_text[start:idx_after].strip()
+                if recovered:
+                    score = 0.80
+                    # Boost score if length matches expected character count
+                    if expected_chars and expected_chars > 0:
+                        ratio = len(recovered) / expected_chars
+                        if 0.7 <= ratio <= 1.3:
+                            score += 0.05  # good width match
+                    return (recovered, min(score, 0.95))
+        return None
+
+    # ---- New step implementations (2.5, 4.5, 6.5, 8) ----
+
+    def _step2_5_incremental_save(
+        self, doc: fitz.Document, page_idx: int, rect: fitz.Rect
+    ) -> Optional[Tuple[str, float]]:
+        """Recover text from older PDF revisions via incremental save history.
+
+        Many PDFs have incremental updates where older page versions may exist
+        unredacted. We parse the startxref chain to find all revisions and compare
+        page content across them.
+        """
+        try:
+            # Read the raw PDF bytes to find incremental save boundaries
+            pdf_bytes = None
+            if hasattr(doc, "tobytes"):
+                pdf_bytes = doc.tobytes()
+            elif hasattr(doc, "write"):
+                pdf_bytes = doc.write()
+            if not pdf_bytes:
+                return None
+
+            # Find all startxref positions (each marks an incremental save)
+            startxref_positions = []
+            search_start = 0
+            while True:
+                pos = pdf_bytes.find(b"startxref", search_start)
+                if pos < 0:
+                    break
+                startxref_positions.append(pos)
+                search_start = pos + 9
+
+            if len(startxref_positions) < 2:
+                # No incremental saves — only one revision
+                return None
+
+            log.debug(
+                "Step 2.5: found %d revisions in PDF", len(startxref_positions)
+            )
+
+            # Get current page text at the redaction rect
+            current_page = doc[page_idx]
+            current_text = current_page.get_textbox(rect)
+
+            # Try opening the PDF truncated at each earlier startxref
+            # to access older revisions
+            for sxref_pos in startxref_positions[:-1]:
+                # Find the %%EOF after this startxref
+                eof_pos = pdf_bytes.find(b"%%EOF", sxref_pos)
+                if eof_pos < 0:
+                    continue
+                truncated = pdf_bytes[: eof_pos + 5]
+                if len(truncated) < 100:
+                    continue
+
+                try:
+                    old_doc = fitz.open(stream=truncated, filetype="pdf")
+                    if page_idx >= len(old_doc):
+                        old_doc.close()
+                        continue
+                    old_page = old_doc[page_idx]
+                    old_text = old_page.get_textbox(rect)
+                    old_doc.close()
+
+                    if old_text and old_text.strip():
+                        old_clean = old_text.strip()
+                        # Only count as recovery if old version has substantive text
+                        # that the current version doesn't have
+                        current_clean = (current_text or "").strip()
+                        if len(old_clean) > len(current_clean) + 2:
+                            alpha_ratio = sum(1 for c in old_clean if c.isalpha()) / max(len(old_clean), 1)
+                            if alpha_ratio > 0.3:
+                                log.debug(
+                                    "Step 2.5 incremental save recovery: [%d chars]",
+                                    len(old_clean),
+                                )
+                                return (old_clean, 0.92)
+                except Exception:
+                    continue
+
+        except Exception as exc:
+            log.debug("Step 2.5 error: %s", exc)
+        return None
+
+    def _step4_5_rasterize_ocr(
+        self, page: fitz.Page, rect: fitz.Rect
+    ) -> Optional[Tuple[str, float]]:
+        """Render the redacted area at high DPI and OCR it.
+
+        Some redactions are improperly applied (overlay opacity < 100%, or
+        non-pure-black). Rasterizing and applying brightness/contrast adjustments
+        can reveal text underneath.
+        """
+        try:
+            # Render just the redaction area at high DPI
+            clip = fitz.Rect(rect)
+            # Expand clip slightly for better OCR context
+            clip.x0 = max(0, clip.x0 - 2)
+            clip.y0 = max(0, clip.y0 - 2)
+            clip.x1 = min(page.rect.width, clip.x1 + 2)
+            clip.y1 = min(page.rect.height, clip.y1 + 2)
+
+            pix = page.get_pixmap(dpi=300, clip=clip)
+            img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
+
+            # Apply brightness/contrast enhancement to reveal faint text
+            from PIL import ImageEnhance, ImageFilter
+
+            results = []
+
+            # Try multiple enhancement levels
+            for brightness_factor in (1.5, 2.0, 3.0):
+                enhanced = ImageEnhance.Brightness(img).enhance(brightness_factor)
+                enhanced = ImageEnhance.Contrast(enhanced).enhance(2.0)
+                # Sharpen to improve OCR accuracy
+                enhanced = enhanced.filter(ImageFilter.SHARPEN)
+
+                try:
+                    ocr_text = pytesseract.image_to_string(
+                        enhanced, lang="eng", config="--psm 6"
+                    ).strip()
+                except Exception:
+                    continue
+
+                if ocr_text and len(ocr_text) > 1:
+                    alpha_ratio = sum(1 for c in ocr_text if c.isalpha()) / max(len(ocr_text), 1)
+                    if alpha_ratio > 0.3:
+                        results.append(ocr_text)
+
+            # Also try grayscale + threshold (for non-pure-black redactions)
+            gray = img.convert("L")
+            # Threshold at multiple levels
+            for threshold in (40, 60, 80):
+                binary = gray.point(lambda x: 255 if x > threshold else 0, "1")
+                try:
+                    ocr_text = pytesseract.image_to_string(
+                        binary, lang="eng", config="--psm 6"
+                    ).strip()
+                except Exception:
+                    continue
+                if ocr_text and len(ocr_text) > 1:
+                    alpha_ratio = sum(1 for c in ocr_text if c.isalpha()) / max(len(ocr_text), 1)
+                    if alpha_ratio > 0.3:
+                        results.append(ocr_text)
+
+            if results:
+                # Pick the longest result (most text recovered)
+                best = max(results, key=len)
+                log.debug("Step 4.5 rasterize-OCR recovery: [%d chars]", len(best))
+                return (best, 0.70)
+
+        except ImportError:
+            log.debug("Step 4.5 skipped: PIL ImageEnhance not available")
+        except Exception as exc:
+            log.debug("Step 4.5 error: %s", exc)
+        return None
+
+    def _step6_5_char_width(
+        self, doc: fitz.Document, page_idx: int, rect: fitz.Rect
+    ) -> Optional[Dict[str, Any]]:
+        """Estimate character count from font metrics and redaction rectangle width.
+
+        Returns a dict with estimation data (not a recovery tuple) since this
+        step provides supplementary data for Steps 7 and 8 rather than direct text.
+        """
+        try:
+            page = doc[page_idx]
+            raw = page.get_text("rawdict")
+            blocks = raw.get("blocks", [])
+
+            # Find spans near the redaction to determine the font in use
+            nearby_spans = []
+            search_rect = fitz.Rect(
+                rect.x0 - 50, rect.y0 - 5, rect.x1 + 50, rect.y1 + 5
+            )
+            for block in blocks:
+                if block.get("type") != 0:
+                    continue
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        span_rect = fitz.Rect(span["bbox"])
+                        if search_rect.intersects(span_rect):
+                            nearby_spans.append(span)
+
+            if not nearby_spans:
+                return None
+
+            # Calculate average character width from nearby spans
+            total_chars = 0
+            total_width = 0.0
+            font_name = None
+            font_size = None
+
+            for span in nearby_spans:
+                text = span.get("text", "")
+                if not text.strip():
+                    continue
+                span_rect = fitz.Rect(span["bbox"])
+                char_count = len(text)
+                if char_count > 0:
+                    total_chars += char_count
+                    total_width += span_rect.width
+                    if font_name is None:
+                        font_name = span.get("font", "unknown")
+                        font_size = span.get("size", 12)
+
+            if total_chars == 0:
+                return None
+
+            avg_char_width = total_width / total_chars
+            estimated_chars = max(1, int(rect.width / avg_char_width))
+
+            result = {
+                "estimated_chars": estimated_chars,
+                "avg_char_width": round(avg_char_width, 2),
+                "font_name": font_name,
+                "font_size": round(font_size, 1) if font_size else None,
+                "redaction_width": round(rect.width, 2),
+                "confidence": 0.40,
+            }
+
+            log.debug(
+                "Step 6.5 char width: ~%d chars (%.1fpt %s, avg_w=%.2f, rect_w=%.1f)",
+                estimated_chars, font_size or 0, font_name or "?",
+                avg_char_width, rect.width,
+            )
+            return result
+
+        except Exception as exc:
+            log.debug("Step 6.5 error: %s", exc)
+        return None
+
+    def _step8_ai_inference(
+        self,
+        context_before: Optional[str],
+        context_after: Optional[str],
+        estimated_chars: int,
+        char_width_info: Optional[Dict] = None,
+        document_id: int = 0,
+    ) -> Optional[Dict[str, Any]]:
+        """AI-powered contextual inference via consensus engine (last resort).
+
+        Builds a rich prompt with surrounding text, character count estimation,
+        and partial recovery data, then sends to available AI models.
+        Returns dict with top_candidate tuple and candidates list.
+        """
+        if not context_before and not context_after:
+            return None
+
+        try:
+            # Import pipeline components
+            from ai_pipeline.pipeline import (
+                GracefulDegradation,
+                ResponseParser,
+            )
+
+            cfg = _load_config()
+            degradation = GracefulDegradation(cfg)
+            runners = degradation.get_available_runners()
+            if not runners:
+                log.debug("Step 8: no AI models available")
+                return None
+
+            # Build the redaction inference prompt
+            prompt = self._build_redaction_inference_prompt(
+                context_before, context_after, estimated_chars,
+                char_width_info, document_id,
+            )
+
+            # Run available models
+            candidates: List[Dict[str, Any]] = []
+            for runner in runners:
+                try:
+                    response = runner.run(prompt, timeout=120)
+                    if not response:
+                        continue
+
+                    # Parse the response for candidate names/text
+                    parsed = self._parse_redaction_inference(response, runner.get_name())
+                    if parsed:
+                        candidates.extend(parsed)
+                except Exception as exc:
+                    log.debug("Step 8 %s error: %s", runner.get_name(), exc)
+                    continue
+
+            if not candidates:
+                return None
+
+            # Score candidates by agreement across models
+            scored = self._score_inference_candidates(candidates)
+            if not scored:
+                return None
+
+            top = scored[0]
+            confidence = min(0.65, max(0.30, top["agreement_score"]))
+            log.debug(
+                "Step 8 AI inference: '%s' (conf=%.2f, %d models agree)",
+                top["text"][:50], confidence, top["model_count"],
+            )
+
+            return {
+                "top_candidate": (top["text"], confidence),
+                "candidates": scored[:5],  # top 5
+            }
+
+        except ImportError:
+            log.debug("Step 8 skipped: ai_pipeline not available")
+        except Exception as exc:
+            log.debug("Step 8 error: %s", exc)
+        return None
+
+    def _build_redaction_inference_prompt(
+        self,
+        context_before: Optional[str],
+        context_after: Optional[str],
+        estimated_chars: int,
+        char_width_info: Optional[Dict],
+        document_id: int,
+    ) -> str:
+        """Build a structured prompt for AI redaction inference."""
+        parts = [
+            "=== REDACTION INFERENCE REQUEST ===",
+            "",
+            "A redacted section was found in a legal/government document related to",
+            "the Jeffrey Epstein case. Analyze the surrounding context and provide",
+            "your best inference for what was redacted.",
+            "",
+        ]
+
+        if context_before:
+            parts.append(f"TEXT BEFORE REDACTION:\n\"{context_before[-300:]}\"")
+            parts.append("")
+        parts.append("[REDACTED]")
+        parts.append("")
+        if context_after:
+            parts.append(f"TEXT AFTER REDACTION:\n\"{context_after[:300]}\"")
+            parts.append("")
+
+        parts.append(f"ESTIMATED CHARACTER COUNT: ~{estimated_chars}")
+        if char_width_info:
+            parts.append(f"FONT: {char_width_info.get('font_name', 'unknown')}")
+            parts.append(f"FONT SIZE: {char_width_info.get('font_size', 'unknown')}pt")
+        parts.append("")
+
+        parts.extend([
+            "Provide your top 5 candidates for what was redacted.",
+            "Format each as: CANDIDATE: <text> | CONFIDENCE: <0-100>% | REASONING: <brief>",
+            "Consider: names of known associates, locations, dates, legal terms,",
+            "financial figures, or other contextually appropriate text.",
+            "The text MUST be approximately the right length (~{} chars).".format(estimated_chars),
+        ])
+
+        return "\n".join(parts)
+
+    @staticmethod
+    def _parse_redaction_inference(
+        response: str, model_name: str
+    ) -> List[Dict[str, Any]]:
+        """Parse AI model response for redaction inference candidates."""
+        candidates = []
+        # Match patterns like: CANDIDATE: <text> | CONFIDENCE: 85% | REASONING: ...
+        pattern = re.compile(
+            r"CANDIDATE:\s*(.+?)\s*\|\s*CONFIDENCE:\s*(\d+)%?\s*\|\s*REASONING:\s*(.+)",
+            re.IGNORECASE,
+        )
+        for match in pattern.finditer(response):
+            text = match.group(1).strip()
+            confidence = int(match.group(2))
+            reasoning = match.group(3).strip()
+            if text and confidence > 0:
+                candidates.append({
+                    "text": text,
+                    "confidence": confidence / 100.0,
+                    "reasoning": reasoning,
+                    "model": model_name,
+                })
+
+        # Fallback: try numbered list format (1. Name (85%) - reason)
+        if not candidates:
+            fallback = re.compile(
+                r"\d+\.\s+(.+?)\s*\((\d+)%?\)\s*[-–—]\s*(.+)"
+            )
+            for match in fallback.finditer(response):
+                text = match.group(1).strip()
+                confidence = int(match.group(2))
+                reasoning = match.group(3).strip()
+                if text and confidence > 0:
+                    candidates.append({
+                        "text": text,
+                        "confidence": confidence / 100.0,
+                        "reasoning": reasoning,
+                        "model": model_name,
+                    })
+
+        return candidates
+
+    @staticmethod
+    def _score_inference_candidates(
+        candidates: List[Dict[str, Any]]
+    ) -> List[Dict[str, Any]]:
+        """Score and rank inference candidates by cross-model agreement."""
+        if not candidates:
+            return []
+
+        # Group by normalized text
+        groups: Dict[str, List[Dict]] = defaultdict(list)
+        for c in candidates:
+            key = c["text"].lower().strip()
+            groups[key].append(c)
+
+        scored = []
+        for key, group in groups.items():
+            models = set(c["model"] for c in group)
+            avg_conf = sum(c["confidence"] for c in group) / len(group)
+            # Agreement score: higher if multiple models agree
+            agreement = avg_conf * (1.0 + 0.15 * (len(models) - 1))
+            scored.append({
+                "text": group[0]["text"],
+                "agreement_score": round(min(agreement, 0.95), 4),
+                "model_count": len(models),
+                "models": list(models),
+                "avg_confidence": round(avg_conf, 4),
+                "reasoning": group[0]["reasoning"],
+            })
+
+        scored.sort(key=lambda x: x["agreement_score"], reverse=True)
+        return scored
 
     # ------------------------------------------------------------------
     @staticmethod
@@ -2296,6 +2861,12 @@ class ProcessorEngine:
             log.error("OCR failed: %s", exc)
             result["stages"]["ocr"] = {"error": str(exc)}
             page_results = []
+            had_errors = True
+
+        # Guard: process_pdf may return [] without raising (e.g. fitz.open fails)
+        if not page_results and not had_errors:
+            log.error("OCR returned 0 pages for %s — treating as failure", file_path)
+            result["stages"]["ocr"] = {"error": "OCR returned 0 pages"}
             had_errors = True
 
         # Combine all text

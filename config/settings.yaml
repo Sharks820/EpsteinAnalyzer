@@ -8,7 +8,7 @@ dashboard:
   host: 127.0.0.1
   port: 8080
   debug: false
-  secret_key: 2cc4cb86f8ab6a26e5e0601b4ccb11fd4b8a828684d62f5c7b111e86df2a35a7
+  # secret_key is now derived at runtime from the vault DEK (no hardcoded key)
 harvester:
   enabled_sources:
   - doj
@@ -73,10 +73,13 @@ processor:
   redaction_forensics:
     text_layer_extraction: true
     pdf_layer_analysis: true
+    incremental_save_recovery: true
     metadata_extraction: true
     ocr_layer_mismatch: true
+    rasterize_ocr: true
     copy_paste_extraction: true
     font_character_analysis: true
+    char_width_estimation: true
     cross_document_matching: true
     ai_inference: true
   image_forensics:
@@ -166,6 +169,12 @@ security:
     prompt_after_session: true
     incremental: true
     encrypt_backups: true
+vault:
+  auto_lock_minutes: 15
+  max_login_attempts: 5
+  vault_key_path: ./config/vault.key
+  encrypt_db_on_shutdown: true
+  encrypt_files_at_rest: true
 evidence:
   scoring:
     direct_admission: 40

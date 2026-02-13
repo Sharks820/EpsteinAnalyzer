@@ -471,6 +471,21 @@ CREATE TABLE IF NOT EXISTS disk_usage (
 );
 
 -- ================================================
+-- VAULT FILE MAP (encrypted file tracking)
+-- ================================================
+
+CREATE TABLE IF NOT EXISTS vault_file_map (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    original_path TEXT NOT NULL,
+    vault_uuid TEXT UNIQUE NOT NULL,
+    encrypted_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_vault_original ON vault_file_map(original_path);
+CREATE INDEX IF NOT EXISTS idx_vault_uuid ON vault_file_map(vault_uuid);
+
+-- ================================================
 -- REMOVED FILES TRACKING (HIGHEST PRIORITY)
 -- ================================================
 

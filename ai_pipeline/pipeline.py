@@ -122,6 +122,50 @@ For each person, state their known role/title at the time of this document.
 Format: NAME | ROLE/TITLE | ORGANISATION | TIME PERIOD (if known)
 """
 
+    _REDACTION_INFERENCE_TEMPLATE = """\
+=== REDACTION INFERENCE REQUEST ===
+
+A redacted section was found in a legal/government document related to the
+Jeffrey Epstein case.  Your task is to infer the most likely content that
+was redacted based on surrounding context, estimated character count, and
+font information.
+
+DOCUMENT TYPE: {doc_type}
+DOCUMENT ID: {document_id}
+
+--- CONTEXT BEFORE REDACTION ---
+{context_before}
+--- END CONTEXT BEFORE ---
+
+[████ REDACTED — approx. {estimated_chars} characters ████]
+
+--- CONTEXT AFTER REDACTION ---
+{context_after}
+--- END CONTEXT AFTER ---
+
+FONT INFORMATION:
+  Font: {font_name}
+  Size: {font_size}pt
+  Estimated characters: ~{estimated_chars}
+  Redaction width: {redaction_width}px
+
+{partial_recovery_block}
+{known_entities_block}
+
+Provide your top 5 candidates for what was redacted.
+For each candidate use this EXACT format (one per line):
+CANDIDATE: <your inferred text> | CONFIDENCE: <0-100>% | REASONING: <one-line explanation>
+
+IMPORTANT RULES:
+- The inferred text MUST be approximately {estimated_chars} characters long.
+- Consider: person names (associates, victims, officials), locations, dates,
+  financial amounts, legal terms, case references, organisation names.
+- Base your reasoning on contextual clues, sentence structure, and known facts.
+- If context suggests a name, cross-reference with known Epstein associates.
+- Higher confidence = stronger contextual evidence.  Do NOT guess above 80%
+  unless the context makes the answer nearly certain.
+"""
+
     def __init__(self, data_dir: Optional[Path] = None):
         if data_dir is None:
             cfg = _load_config()
@@ -134,6 +178,52 @@ Format: NAME | ROLE/TITLE | ORGANISATION | TIME PERIOD (if known)
     # ------------------------------------------------------------------
     # Public
     # ------------------------------------------------------------------
+
+    def build_redaction_inference_prompt(
+        self,
+        context_before: Optional[str],
+        context_after: Optional[str],
+        estimated_chars: int,
+        document_id: int = 0,
+        doc_type: str = "legal/government",
+        font_name: str = "unknown",
+        font_size: float = 12.0,
+        redaction_width: float = 0.0,
+        partial_recovery: Optional[str] = None,
+        known_entities: Optional[list[dict]] = None,
+    ) -> str:
+        """Build a structured prompt for AI-powered redaction inference."""
+        partial_block = ""
+        if partial_recovery:
+            partial_block = (
+                "PARTIAL RECOVERY (from other forensic steps):\n"
+                f"  \"{partial_recovery}\"\n"
+                "  Use this as a strong hint but verify against context.\n"
+            )
+
+        entities_block = self._format_known_entities(known_entities)
+
+        prompt = self._REDACTION_INFERENCE_TEMPLATE.format(
+            doc_type=doc_type,
+            document_id=document_id,
+            context_before=context_before or "(no context available)",
+            context_after=context_after or "(no context available)",
+            estimated_chars=estimated_chars,
+            font_name=font_name,
+            font_size=font_size,
+            redaction_width=redaction_width,
+            partial_recovery_block=partial_block,
+            known_entities_block=entities_block,
+        )
+
+        # Persist to queue for audit trail
+        prompt_hash = hashlib.sha256(prompt.encode()).hexdigest()[:16]
+        ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+        prompt_path = self.queue_dir / f"redaction_inference_{ts}_{prompt_hash}.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        logger.debug("Redaction inference prompt saved to %s", prompt_path)
+
+        return prompt
 
     def build_analysis_prompt(
         self,
@@ -1398,7 +1488,7 @@ class PipelineEngine:
         conn = self.db.get_connection()
         try:
             conn.execute("""
-                INSERT INTO ai_consensus (
+                INSERT OR REPLACE INTO ai_consensus (
                     document_id, consensus_summary, consensus_entities,
                     consensus_connections, consensus_evidence_scores,
                     consensus_redaction_inferences, agreement_level,
@@ -1473,20 +1563,24 @@ class PipelineEngine:
                 ).fetchone()
                 eid = existing["id"]
 
-                # Only bump count for existing entities (new ones already have count=1)
-                if not inserted_new:
-                    conn.execute(
-                        "UPDATE entities SET document_count = document_count + 1, updated_at = ? WHERE id = ?",
-                        (now, eid),
-                    )
-
                 entity_id_map[canonical.lower()] = eid
 
-                # Link entity to document
-                conn.execute("""
-                    INSERT OR IGNORE INTO entity_document_links (entity_id, document_id, mention_type, created_at)
-                    VALUES (?, ?, 'mentioned', ?)
-                """, (eid, document_id, now))
+                # Link entity to document (skip increment if already linked)
+                already_linked = conn.execute(
+                    "SELECT 1 FROM entity_document_links WHERE entity_id = ? AND document_id = ?",
+                    (eid, document_id),
+                ).fetchone()
+                if not already_linked:
+                    conn.execute("""
+                        INSERT OR IGNORE INTO entity_document_links (entity_id, document_id, mention_type, created_at)
+                        VALUES (?, ?, 'mentioned', ?)
+                    """, (eid, document_id, now))
+                    # Only bump count for existing entities if this is a NEW link
+                    if not inserted_new:
+                        conn.execute(
+                            "UPDATE entities SET document_count = document_count + 1, updated_at = ? WHERE id = ?",
+                            (now, eid),
+                        )
 
             # --- Evidence scores ---
             scores_list = consensus.get("evidence_scores") or []
@@ -1496,11 +1590,24 @@ class PipelineEngine:
                 name_key = re.sub(r"\s+", " ", sc.get("name", "")).strip().title().lower()
                 eid = entity_id_map.get(name_key)
                 if eid:
-                    conn.execute(
-                        "UPDATE entities SET implication_score = MAX(implication_score, ?), "
-                        "evidence_count = evidence_count + 1, updated_at = ? WHERE id = ?",
-                        (sc.get("score", 0), now, eid),
-                    )
+                    # Only increment evidence_count if this doc hasn't already been scored
+                    existing_score = conn.execute(
+                        "SELECT damning_score FROM entity_document_links WHERE entity_id = ? AND document_id = ?",
+                        (eid, document_id),
+                    ).fetchone()
+                    if existing_score and existing_score["damning_score"]:
+                        # Already scored — just update the max implication score
+                        conn.execute(
+                            "UPDATE entities SET implication_score = MAX(implication_score, ?), "
+                            "updated_at = ? WHERE id = ?",
+                            (sc.get("score", 0), now, eid),
+                        )
+                    else:
+                        conn.execute(
+                            "UPDATE entities SET implication_score = MAX(implication_score, ?), "
+                            "evidence_count = evidence_count + 1, updated_at = ? WHERE id = ?",
+                            (sc.get("score", 0), now, eid),
+                        )
                     # Update entity-document link score
                     conn.execute("""
                         UPDATE entity_document_links SET damning_score = ?, score_reasoning = ?
@@ -1521,18 +1628,22 @@ class PipelineEngine:
 
                 if src_id and tgt_id and src_id != tgt_id:
                     existing_rel = conn.execute(
-                        "SELECT id, evidence_count FROM relationships "
+                        "SELECT id, evidence_count, evidence_document_ids FROM relationships "
                         "WHERE source_entity_id = ? AND target_entity_id = ? AND relationship_type = ?",
                         (src_id, tgt_id, rel_type),
                     ).fetchone()
 
                     if existing_rel:
-                        conn.execute("""
-                            UPDATE relationships
-                            SET weight = weight + 1, evidence_count = evidence_count + 1,
-                                updated_at = ?
-                            WHERE id = ?
-                        """, (now, existing_rel["id"]))
+                        # Only increment if this document hasn't already been counted
+                        existing_doc_ids = json.loads(existing_rel["evidence_document_ids"] or "[]")
+                        if document_id not in existing_doc_ids:
+                            existing_doc_ids.append(document_id)
+                            conn.execute("""
+                                UPDATE relationships
+                                SET weight = weight + 1, evidence_count = evidence_count + 1,
+                                    evidence_document_ids = ?, updated_at = ?
+                                WHERE id = ?
+                            """, (json.dumps(existing_doc_ids), now, existing_rel["id"]))
                     else:
                         evidence_doc_ids = json.dumps([document_id])
                         conn.execute("""

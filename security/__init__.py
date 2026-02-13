@@ -10,6 +10,15 @@ from .security import (
     USBProtection,
     SecurityManager,
 )
+from .vault import (
+    KeyManager,
+    SecureKey,
+    DashboardAuth,
+    NullDatabaseProxy,
+    VaultFileManager,
+    DatabaseVault,
+    check_os_hardening,
+)
 
 __all__ = [
     "EncryptionManager",
@@ -19,4 +28,11 @@ __all__ = [
     "SessionWiper",
     "USBProtection",
     "SecurityManager",
+    "KeyManager",
+    "SecureKey",
+    "DashboardAuth",
+    "NullDatabaseProxy",
+    "VaultFileManager",
+    "DatabaseVault",
+    "check_os_hardening",
 ]

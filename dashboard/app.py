@@ -4,15 +4,19 @@ Flask web UI for investigative document analysis.
 Runs locally at http://127.0.0.1:8080
 """
 
+import hmac
 import html
+import io
 import jinja2
 import json
 import logging
 import os
 import re
+import secrets
 import sys
 import sqlite3
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -24,7 +28,9 @@ from flask import (
     redirect,
     url_for,
     abort,
+    send_file,
     send_from_directory,
+    session,
 )
 from flask_socketio import SocketIO, emit
 
@@ -37,6 +43,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from database.db import DatabaseManager  # noqa: E402
 
+# Prevent .pyc files from being written
+os.environ["PYTHONDONTWRITEBYTECODE"] = "1"
+sys.dont_write_bytecode = True
+
 # ---------------------------------------------------------------------------
 # Flask application factory
 # ---------------------------------------------------------------------------
@@ -44,10 +54,20 @@ app = Flask(__name__)
 app.config["SECRET_KEY"] = os.environ.get(
     "EPSTEIN_SECRET_KEY", os.urandom(32).hex()
 )
+app.config["SESSION_COOKIE_SAMESITE"] = "Strict"
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SECURE"] = False  # localhost, no HTTPS
 socketio = SocketIO(app, async_mode="threading")
+
+# Vault integration (initialized at startup if vault exists)
+_vault_auth = None       # DashboardAuth instance
+_vault_key_mgr = None    # KeyManager instance
+_vault_file_mgr = None   # VaultFileManager instance
+_vault_mode = None        # "master" or "decoy"
 
 # Lazy-initialized database manager (avoids import-time side effects)
 _db: "DatabaseManager | None" = None
+_real_db: "DatabaseManager | None" = None  # preserved reference for restoring after decoy
 _db_lock = threading.Lock()
 logger = logging.getLogger(__name__)
 
@@ -138,6 +158,7 @@ BASE_TEMPLATE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="csrf-token" content="{{ csrf_token_value }}">
 <title>{% block title %}EpsteinAnalyzer{% endblock %}</title>
 <style>
 /* ---- reset & base ---- */
@@ -338,6 +359,7 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
       <a href="/export" class="{% if active == 'export' %}active{% endif %}">&#9112; Export Tools</a>
       <a href="/audit" class="{% if active == 'audit' %}active{% endif %}">&#9783; Audit Log</a>
       <a href="/settings" class="{% if active == 'settings' %}active{% endif %}">&#9881; Settings</a>
+      <a href="/logout" style="margin-top:auto;border-top:1px solid var(--border)">&#10140; Logout &amp; Lock</a>
     </nav>
     <div class="sidebar-footer">
       Disk: {{ disk_pct }}% of {{ disk_max_gb }} GB<br>
@@ -356,9 +378,9 @@ input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);
 
 <div id="toast-container" class="toast-container"></div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.4/socket.io.min.js"></script>
+<script src="/static/socket.io.min.js"></script>
 <script>
-const socket = io();
+const socket = io({transports: ['websocket']});
 socket.on('progress', function(data){
   showToast(data.message, data.level || 'info');
 });
@@ -374,7 +396,8 @@ function showToast(msg, level){
   setTimeout(()=>{ t.style.opacity='0'; setTimeout(()=>t.remove(),300); }, 4000);
 }
 function apiPost(url, body){
-  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body||{})})
+  const csrfToken = document.querySelector('meta[name="csrf-token"]')?.content || '';
+  return fetch(url,{method:'POST',headers:{'Content-Type':'application/json','X-CSRF-Token':csrfToken},body:JSON.stringify(body||{})})
     .then(r=>r.json());
 }
 function apiGet(url){
@@ -397,12 +420,157 @@ def inject_sidebar_data():
     except Exception as e:
         logger.warning("sidebar stats failed: %s", e)
         stats = {}
+
+    # Ensure CSRF token exists in session
+    if "_csrf_token" not in session:
+        session["_csrf_token"] = secrets.token_hex(32)
+
     return {
         "pending_images": stats.get("pending_image_reviews", 0),
         "pending_deletions": stats.get("pending_deletions", 0),
         "disk_pct": stats.get("disk_usage_percent", 0),
         "disk_max_gb": stats.get("disk_max_gb", 0),
+        "csrf_token_value": session.get("_csrf_token", ""),
     }
+
+
+@app.before_request
+def csrf_protect():
+    """Validate CSRF token on all POST/PUT/DELETE requests."""
+    if request.method in ("POST", "PUT", "DELETE"):
+        # Skip CSRF for login (has its own token in form)
+        if request.path == "/login":
+            return None
+        # Check header first (AJAX), then form field
+        token = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token")
+        expected = session.get("_csrf_token", "")
+        if not token or not hmac.compare_digest(token, expected):
+            abort(403)
+
+
+# ============================================================================
+#  LOGIN PAGE
+# ============================================================================
+
+LOGIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Login - EpsteinAnalyzer</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0d1117; --bg2:#161b22; --bg3:#1c2333;
+  --fg:#e6edf3; --fg2:#8b949e; --accent:#58a6ff; --accent2:#1f6feb;
+  --red:#f85149; --border:#30363d; --green:#3fb950;
+  --font-sans:-apple-system,BlinkMacSystemFont,'Segoe UI',Helvetica,Arial,sans-serif;
+}
+html{font-size:14px}
+body{background:var(--bg);color:var(--fg);font-family:var(--font-sans);
+  display:flex;align-items:center;justify-content:center;min-height:100vh}
+.login-box{background:var(--bg2);border:1px solid var(--border);border-radius:12px;
+  padding:40px;width:400px;max-width:90vw}
+.login-box h1{font-size:1.4rem;margin-bottom:8px;text-align:center}
+.login-box .subtitle{color:var(--fg2);font-size:.85rem;text-align:center;margin-bottom:24px}
+.login-box .dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--green);
+  animation:pulse 2s infinite;margin-right:6px}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
+.form-group{margin-bottom:16px}
+.form-group label{display:block;margin-bottom:6px;font-size:.85rem;color:var(--fg2)}
+.form-group input{background:var(--bg3);border:1px solid var(--border);border-radius:6px;
+  color:var(--fg);padding:10px 14px;font-size:.92rem;width:100%;font-family:inherit}
+.form-group input:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(88,166,255,.15)}
+.btn-login{width:100%;padding:12px;background:var(--accent2);border:none;border-radius:6px;
+  color:#fff;font-size:.95rem;font-weight:600;cursor:pointer;transition:.15s;font-family:inherit}
+.btn-login:hover{background:#388bfd}
+.error{color:var(--red);font-size:.85rem;margin-bottom:12px;text-align:center}
+.attempts{color:var(--fg2);font-size:.78rem;text-align:center;margin-top:12px}
+</style>
+</head>
+<body>
+<div class="login-box">
+  <h1><span class="dot"></span> EpsteinAnalyzer</h1>
+  <p class="subtitle">Secure Document Analysis Platform</p>
+  {% if error %}
+  <div class="error">{{ error }}</div>
+  {% endif %}
+  <form method="post" action="/login">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+    <div class="form-group">
+      <label for="password">Password</label>
+      <input type="password" id="password" name="password" autofocus
+             autocomplete="current-password" required>
+    </div>
+    <button type="submit" class="btn-login">Unlock</button>
+  </form>
+  {% if attempts_info %}
+  <p class="attempts">{{ attempts_info }}</p>
+  {% endif %}
+</div>
+</body>
+</html>"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    """Login page — first gate for vault authentication."""
+    global _vault_mode
+
+    error = None
+    attempts_info = None
+
+    if request.method == "POST":
+        password = request.form.get("password", "")
+        # Validate CSRF token (constant-time comparison)
+        token = request.form.get("csrf_token", "")
+        expected_csrf = session.get("_csrf_token", "")
+        if not token or not hmac.compare_digest(token, expected_csrf):
+            error = "Invalid request. Please try again."
+        elif _vault_auth:
+            success, mode, message = _vault_auth.attempt_login(password)
+            if success:
+                _vault_mode = mode
+                global _db, _real_db
+                if mode == "decoy":
+                    # Save real DB reference before swapping to decoy
+                    from security.vault import NullDatabaseProxy
+                    if _real_db is None:
+                        _real_db = _db
+                    schema_path = str(PROJECT_ROOT / "database" / "schema.sql")
+                    _db = NullDatabaseProxy(schema_path)
+                elif _real_db is not None:
+                    # Restore real DB after a previous decoy session
+                    _db = _real_db
+                    _real_db = None
+                return redirect(url_for("command_center"))
+            else:
+                error = message
+        else:
+            # No vault configured — fail closed, do NOT auto-authenticate
+            error = "Vault not configured. Run 'python setup.py init' to set up security."
+
+    # Generate CSRF token
+    if "_csrf_token" not in session:
+        session["_csrf_token"] = secrets.token_hex(32)
+
+    return render_template_string(
+        LOGIN_HTML,
+        error=error,
+        attempts_info=attempts_info,
+        csrf_token=session["_csrf_token"],
+    )
+
+
+@app.route("/logout")
+def logout():
+    """Logout and lock vault."""
+    global _vault_mode
+    if _vault_auth:
+        _vault_auth.logout()
+    _vault_mode = None
+    session.clear()
+    return redirect(url_for("login"))
 
 
 # ============================================================================
@@ -913,8 +1081,30 @@ def serve_file(doc_id):
     doc = query_one("SELECT file_path FROM documents WHERE id = ?", (doc_id,))
     if not doc or not doc.get("file_path"):
         abort(404)
+
+    # Try vault decryption first
+    if _vault_file_mgr:
+        vault_uuid = _vault_file_mgr.get_vault_uuid_for_path(doc["file_path"])
+        if vault_uuid:
+            try:
+                buf = _vault_file_mgr.decrypt_to_memory(vault_uuid)
+                # Determine mimetype from original filename
+                ext = Path(doc["file_path"]).suffix.lower()
+                mimetypes = {
+                    ".pdf": "application/pdf", ".png": "image/png",
+                    ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+                    ".txt": "text/plain", ".csv": "text/csv",
+                }
+                mimetype = mimetypes.get(ext, "application/octet-stream")
+                return send_file(
+                    buf, mimetype=mimetype,
+                    download_name=Path(doc["file_path"]).name,
+                )
+            except Exception as e:
+                logger.warning("Vault decrypt failed for doc %d: %s", doc_id, e)
+
+    # Fallback: serve from disk
     fp = Path(doc["file_path"]).resolve()
-    # Prevent path traversal: file must be inside the configured data directory
     data_dir = _get_db().data_dir.resolve()
     if not fp.is_relative_to(data_dir):
         abort(403)
@@ -1843,6 +2033,28 @@ def serve_image(image_id):
         abort(404)
     if image.get("quarantined") or image.get("minor_detected"):
         abort(403)
+
+    # Try vault decryption first
+    if _vault_file_mgr:
+        vault_uuid = _vault_file_mgr.get_vault_uuid_for_path(image["file_path"])
+        if vault_uuid:
+            try:
+                buf = _vault_file_mgr.decrypt_to_memory(vault_uuid)
+                ext = Path(image["file_path"]).suffix.lower()
+                mimetypes = {
+                    ".png": "image/png", ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg", ".gif": "image/gif",
+                    ".bmp": "image/bmp", ".tiff": "image/tiff",
+                }
+                mimetype = mimetypes.get(ext, "image/png")
+                return send_file(
+                    buf, mimetype=mimetype,
+                    download_name=Path(image["file_path"]).name,
+                )
+            except Exception as e:
+                logger.warning("Vault decrypt failed for image %d: %s", image_id, e)
+
+    # Fallback: serve from disk
     fp = Path(image["file_path"]).resolve()
     data_dir = _get_db().data_dir.resolve()
     if not fp.is_relative_to(data_dir):
@@ -2689,6 +2901,9 @@ def api_document_flag(doc_id):
 
 @socketio.on("connect")
 def handle_connect():
+    from flask import session as flask_session
+    if not flask_session.get("authenticated"):
+        return False  # Reject unauthenticated Socket.IO connections
     emit("progress", {"message": "Connected to EpsteinAnalyzer", "level": "info"})
 
 
@@ -2726,6 +2941,10 @@ app.jinja_env.loader = _OverlayLoader(app.jinja_env.loader)
 
 def main():
     import yaml
+    import getpass
+
+    global _vault_auth, _vault_key_mgr, _vault_file_mgr, _vault_mode, _db
+
     config_path = PROJECT_ROOT / "config" / "settings.yaml"
     with open(config_path) as f:
         config = yaml.safe_load(f)
@@ -2733,10 +2952,72 @@ def main():
     host = config.get("dashboard", {}).get("host", "127.0.0.1")
     port = config.get("dashboard", {}).get("port", 8080)
     debug = config.get("dashboard", {}).get("debug", False)
-    secret = config.get("dashboard", {}).get("secret_key", "")
-    if secret and secret not in ("CHANGE_THIS_ON_FIRST_RUN", "local-dev-key"):
-        app.config["SECRET_KEY"] = secret
-    # else: keep the random key generated at import time
+
+    # --- Vault integration ---
+    vault_cfg = config.get("vault", {})
+    vault_key_path = PROJECT_ROOT / vault_cfg.get("vault_key_path", "config/vault.key")
+
+    if vault_key_path.exists():
+        from security.vault import (
+            KeyManager, DashboardAuth, VaultFileManager,
+            DatabaseVault, NullDatabaseProxy,
+            check_os_hardening, suppress_crash_dumps, prevent_sleep_while_unlocked,
+        )
+
+        # OS hardening
+        suppress_crash_dumps()
+        warnings = check_os_hardening()
+        for w in warnings:
+            print(f"  [!] WARNING: {w}")
+
+        # First gate: console password prompt
+        _vault_key_mgr = KeyManager(str(vault_key_path))
+        print(f"\n{'='*60}")
+        print(f"  EpsteinAnalyzer - Vault Unlock")
+        print(f"{'='*60}")
+
+        password = getpass.getpass("  Enter password: ")
+        try:
+            mode, secure_key = _vault_key_mgr.unlock(password)
+            _vault_mode = mode
+            print(f"  [+] Vault unlocked ({mode} mode)")
+
+            # Derive Flask secret from DEK
+            app.config["SECRET_KEY"] = _vault_key_mgr.get_flask_secret()
+
+            # Decrypt database if encrypted
+            if vault_cfg.get("encrypt_db_on_shutdown", True):
+                db_path = PROJECT_ROOT / "data" / "epstein.db"
+                db_vault = DatabaseVault(_vault_key_mgr, str(db_path))
+                if db_vault.decrypt_db():
+                    print("  [+] Database decrypted")
+
+            # Set up decoy mode if needed
+            if mode == "decoy":
+                schema_path = str(PROJECT_ROOT / "database" / "schema.sql")
+                _db = NullDatabaseProxy(schema_path)
+                print("  [+] Decoy mode: empty data will be shown")
+            else:
+                # Initialize vault file manager for serving encrypted files
+                data_dir = str(Path(config["project"]["data_dir"]).resolve())
+                _vault_file_mgr = VaultFileManager(_vault_key_mgr, data_dir, _get_db())
+
+            # Set up authentication middleware (second gate: browser login)
+            _vault_auth = DashboardAuth(app, _vault_key_mgr, config)
+            prevent_sleep_while_unlocked()
+
+        except ValueError as e:
+            # Wrong password at console - could be decoy
+            print(f"  [!] {e}")
+            sys.exit(1)
+        except FileNotFoundError as e:
+            print(f"  [!] {e}")
+            sys.exit(1)
+    else:
+        # No vault configured — fail closed
+        print("  [!] FATAL: No vault configured. Authentication is required.")
+        print("  [!] Run 'python setup.py init' to set up the security vault.")
+        sys.exit(1)
 
     print(f"\n{'='*60}")
     print(f"  EpsteinAnalyzer Dashboard")
@@ -2744,6 +3025,22 @@ def main():
     print(f"{'='*60}\n")
 
     socketio.run(app, host=host, port=port, debug=debug, allow_unsafe_werkzeug=True)
+
+    # --- Shutdown: encrypt DB ---
+    if _vault_key_mgr and vault_key_path.exists():
+        try:
+            from security.vault import DatabaseVault, allow_sleep
+            vault_cfg = config.get("vault", {})
+            if vault_cfg.get("encrypt_db_on_shutdown", True):
+                db_path = PROJECT_ROOT / "data" / "epstein.db"
+                db_vault = DatabaseVault(_vault_key_mgr, str(db_path))
+                conn = _get_db().get_connection()
+                db_vault.checkpoint_and_encrypt(conn)
+                print("  [+] Database encrypted on shutdown")
+            _vault_key_mgr.lock()
+            allow_sleep()
+        except Exception as e:
+            logger.warning("Shutdown encryption failed: %s", e)
 
 
 if __name__ == "__main__":

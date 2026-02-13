@@ -3,6 +3,7 @@ EpsteinAnalyzer - Security Module
 Encryption, integrity monitoring, backups, session wipe, honeypots.
 AES-256-GCM encryption at rest with Scrypt key derivation.
 """
+import glob as glob_mod
 import os
 import sys
 import hmac
@@ -12,6 +13,7 @@ import shutil
 import secrets
 import struct
 import logging
+import tempfile
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional
@@ -21,6 +23,11 @@ from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
 from cryptography.hazmat.backends import default_backend
 
 logger = logging.getLogger("security")
+
+# Encrypted file format constants
+EAEF_MAGIC = b"EAEF"
+EAEF_VERSION = 1
+KDF_SCRYPT_ID = 1
 
 # ============================================================
 # ENCRYPTION MANAGER
@@ -51,76 +58,143 @@ class EncryptionManager:
         key = kdf.derive(password.encode("utf-8"))
         return key, salt
 
-    def encrypt_data(self, data: bytes, password: str) -> bytes:
+    def encrypt_data(self, data: bytes, password: str, aad: bytes = None) -> bytes:
         key, salt = self.derive_key(password)
         nonce = os.urandom(self.NONCE_SIZE)
         aesgcm = AESGCM(key)
-        ciphertext = aesgcm.encrypt(nonce, data, None)
+        ciphertext = aesgcm.encrypt(nonce, data, aad)
         # Format: salt + nonce + ciphertext
         return salt + nonce + ciphertext
 
-    def decrypt_data(self, encrypted: bytes, password: str) -> bytes:
+    def decrypt_data(self, encrypted: bytes, password: str, aad: bytes = None) -> bytes:
         salt = encrypted[: self.SALT_SIZE]
         nonce = encrypted[self.SALT_SIZE : self.SALT_SIZE + self.NONCE_SIZE]
         ciphertext = encrypted[self.SALT_SIZE + self.NONCE_SIZE :]
         key, _ = self.derive_key(password, salt)
         aesgcm = AESGCM(key)
-        return aesgcm.decrypt(nonce, ciphertext, None)
+        return aesgcm.decrypt(nonce, ciphertext, aad)
 
     def encrypt_file(self, file_path: str, password: str, output_path: str = None):
-        """Encrypt a file using chunked I/O to avoid loading entire file into memory."""
+        """Encrypt a file using chunked I/O with format header and per-chunk AAD.
+
+        Format: EAEF(4) + version(1) + kdf_id(1) + chunk_size(4) + salt(32) + chunks...
+        Each chunk: nonce(12) + ct_len(4) + ciphertext (includes 16-byte GCM tag)
+        AAD per chunk: chunk_index as 4-byte big-endian
+        """
         file_path = Path(file_path)
         if output_path is None:
             output_path = str(file_path) + ".enc"
         key, salt = self.derive_key(password)
         aesgcm = AESGCM(key)
         with open(file_path, "rb") as fin, open(output_path, "wb") as fout:
+            # Write file format header
+            fout.write(EAEF_MAGIC)
+            fout.write(struct.pack("B", EAEF_VERSION))
+            fout.write(struct.pack("B", KDF_SCRYPT_ID))
+            fout.write(struct.pack(">I", self.CHUNK_SIZE))
             fout.write(salt)
+            chunk_index = 0
             while True:
                 chunk = fin.read(self.CHUNK_SIZE)
                 if not chunk:
                     break
                 nonce = os.urandom(self.NONCE_SIZE)
-                ct = aesgcm.encrypt(nonce, chunk, None)
-                fout.write(len(ct).to_bytes(4, "big"))
+                # AAD = chunk index for ordering integrity
+                aad = struct.pack(">I", chunk_index)
+                ct = aesgcm.encrypt(nonce, chunk, aad)
                 fout.write(nonce)
+                fout.write(len(ct).to_bytes(4, "big"))
                 fout.write(ct)
+                chunk_index += 1
         return output_path
 
     def decrypt_file(self, file_path: str, password: str, output_path: str = None):
-        """Decrypt a file using chunked I/O to avoid loading entire file into memory."""
+        """Decrypt a file using chunked I/O. Supports both new format (EAEF header)
+        and legacy format (raw salt + chunks) for backward compatibility."""
         file_path = Path(file_path)
         if output_path is None:
-            # Properly strip .enc suffix instead of brittle .replace()
             if file_path.suffix == ".enc":
                 output_path = str(file_path.with_suffix(""))
             else:
                 output_path = str(file_path) + ".dec"
-        with open(file_path, "rb") as fin:
-            salt = fin.read(self.SALT_SIZE)
-            if len(salt) < self.SALT_SIZE:
-                raise ValueError("Invalid encrypted file: too short for salt")
-            key, _ = self.derive_key(password, salt)
-            aesgcm = AESGCM(key)
-            with open(output_path, "wb") as fout:
-                while True:
-                    ct_len_bytes = fin.read(4)
-                    if not ct_len_bytes:
-                        break  # Clean EOF at chunk boundary
-                    if len(ct_len_bytes) < 4:
-                        raise ValueError("Corrupted encrypted file: truncated chunk header")
-                    ct_len = int.from_bytes(ct_len_bytes, "big")
-                    max_ct = self.CHUNK_SIZE + 1024  # chunk + GCM tag overhead
-                    if ct_len > max_ct:
-                        raise ValueError(f"Corrupted encrypted file: chunk size {ct_len} exceeds maximum {max_ct}")
-                    nonce = fin.read(self.NONCE_SIZE)
-                    if len(nonce) < self.NONCE_SIZE:
-                        raise ValueError("Corrupted encrypted file: truncated nonce")
-                    ct = fin.read(ct_len)
-                    if len(ct) < ct_len:
-                        raise ValueError("Corrupted encrypted file: truncated ciphertext")
-                    plaintext = aesgcm.decrypt(nonce, ct, None)
-                    fout.write(plaintext)
+        # Write to temp file first to avoid partial plaintext on failure
+        tmp_path = output_path + ".tmp"
+        try:
+            with open(file_path, "rb") as fin:
+                # Detect format: check for EAEF magic
+                header_peek = fin.read(4)
+                if len(header_peek) < 4:
+                    raise ValueError("Invalid encrypted file: too short")
+
+                if header_peek == EAEF_MAGIC:
+                    # New format with header
+                    version = struct.unpack("B", fin.read(1))[0]
+                    kdf_id = struct.unpack("B", fin.read(1))[0]
+                    chunk_size = struct.unpack(">I", fin.read(4))[0]
+                    salt = fin.read(self.SALT_SIZE)
+                    if len(salt) < self.SALT_SIZE:
+                        raise ValueError("Invalid encrypted file: truncated salt")
+                    key, _ = self.derive_key(password, salt)
+                    aesgcm = AESGCM(key)
+                    max_ct = chunk_size + 16  # GCM tag is exactly 16 bytes
+                    with open(tmp_path, "wb") as fout:
+                        chunk_index = 0
+                        while True:
+                            nonce = fin.read(self.NONCE_SIZE)
+                            if not nonce:
+                                break
+                            if len(nonce) < self.NONCE_SIZE:
+                                raise ValueError("Corrupted encrypted file: truncated nonce")
+                            ct_len_bytes = fin.read(4)
+                            if not ct_len_bytes or len(ct_len_bytes) < 4:
+                                raise ValueError("Corrupted encrypted file: truncated chunk header")
+                            ct_len = int.from_bytes(ct_len_bytes, "big")
+                            if ct_len > max_ct:
+                                raise ValueError(f"Corrupted encrypted file: chunk size {ct_len} exceeds maximum {max_ct}")
+                            ct = fin.read(ct_len)
+                            if len(ct) < ct_len:
+                                raise ValueError("Corrupted encrypted file: truncated ciphertext")
+                            aad = struct.pack(">I", chunk_index)
+                            plaintext = aesgcm.decrypt(nonce, ct, aad)
+                            fout.write(plaintext)
+                            chunk_index += 1
+                else:
+                    # Legacy format: salt(32) + chunks(ct_len(4) + nonce(12) + ct)
+                    # header_peek is the first 4 bytes of the 32-byte salt
+                    rest_of_salt = fin.read(self.SALT_SIZE - 4)
+                    salt = header_peek + rest_of_salt
+                    if len(salt) < self.SALT_SIZE:
+                        raise ValueError("Invalid encrypted file: too short for salt")
+                    key, _ = self.derive_key(password, salt)
+                    aesgcm = AESGCM(key)
+                    max_ct = self.CHUNK_SIZE + 16  # Tightened: GCM tag is exactly 16 bytes
+                    with open(tmp_path, "wb") as fout:
+                        while True:
+                            ct_len_bytes = fin.read(4)
+                            if not ct_len_bytes:
+                                break
+                            if len(ct_len_bytes) < 4:
+                                raise ValueError("Corrupted encrypted file: truncated chunk header")
+                            ct_len = int.from_bytes(ct_len_bytes, "big")
+                            if ct_len > max_ct:
+                                raise ValueError(f"Corrupted encrypted file: chunk size {ct_len} exceeds maximum {max_ct}")
+                            nonce = fin.read(self.NONCE_SIZE)
+                            if len(nonce) < self.NONCE_SIZE:
+                                raise ValueError("Corrupted encrypted file: truncated nonce")
+                            ct = fin.read(ct_len)
+                            if len(ct) < ct_len:
+                                raise ValueError("Corrupted encrypted file: truncated ciphertext")
+                            plaintext = aesgcm.decrypt(nonce, ct, None)
+                            fout.write(plaintext)
+            # Success — atomically move temp to final path
+            os.replace(tmp_path, output_path)
+        except Exception:
+            # Remove partial plaintext on any failure
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
         return output_path
 
 
@@ -464,19 +538,52 @@ class SessionWiper:
 
         # 1. Clear temp directory with secure overwrite
         temp_dir = self.data_dir / "temp"
-        for f in temp_dir.rglob("*"):
-            if f.is_file():
-                self._secure_delete(f)
-                wiped += 1
+        if temp_dir.exists():
+            for f in temp_dir.rglob("*"):
+                if f.is_file():
+                    self._secure_delete(f)
+                    wiped += 1
 
         # 2. Clear analysis queue processed files
         queue_dir = self.data_dir / "analysis_queue"
-        for f in queue_dir.rglob("*.txt"):
-            if f.is_file():
-                self._secure_delete(f)
-                wiped += 1
+        if queue_dir.exists():
+            for f in queue_dir.rglob("*.txt"):
+                if f.is_file():
+                    self._secure_delete(f)
+                    wiped += 1
 
-        # 3. Clear clipboard (Windows)
+        # 3. Clear SQLite WAL and SHM files
+        db_dir = self.data_dir.parent / "data"
+        for pattern in ["*.db-wal", "*.db-shm"]:
+            for f in self.data_dir.parent.rglob(pattern):
+                if f.is_file():
+                    self._secure_delete(f)
+                    wiped += 1
+
+        # 4. Clear __pycache__ directories
+        project_root = self.data_dir.parent
+        for cache_dir in project_root.rglob("__pycache__"):
+            if cache_dir.is_dir():
+                for f in cache_dir.rglob("*"):
+                    if f.is_file():
+                        self._secure_delete(f)
+                        wiped += 1
+                try:
+                    shutil.rmtree(str(cache_dir), ignore_errors=True)
+                except Exception:
+                    pass
+
+        # 5. Clear AI pipeline temp files (ea_*_*.txt in system temp)
+        try:
+            sys_temp = Path(tempfile.gettempdir())
+            for f in sys_temp.glob("ea_*_*.txt"):
+                if f.is_file():
+                    self._secure_delete(f)
+                    wiped += 1
+        except Exception:
+            logger.debug("System temp cleanup failed", exc_info=True)
+
+        # 6. Clear clipboard (Windows)
         try:
             if sys.platform == "win32":
                 import subprocess
@@ -537,8 +644,21 @@ class USBProtection:
         self.attempts_file = self.backup_path / ".attempts"
 
     def _hmac_key(self) -> bytes:
-        """Derive a stable HMAC key from the backup path."""
-        return hashlib.sha256(str(self.backup_path).encode()).digest()
+        """Get or create a random per-backup HMAC secret.
+
+        A 32-byte random key is generated on first use and stored in a
+        hidden file next to the attempts counter.  This prevents an attacker
+        who knows the backup path from forging the attempt counter.
+        """
+        secret_file = self.backup_path / ".hmac_secret"
+        if secret_file.exists():
+            raw = secret_file.read_bytes()
+            if len(raw) == 32:
+                return raw
+        # Generate fresh secret
+        secret = os.urandom(32)
+        secret_file.write_bytes(secret)
+        return secret
 
     def record_attempt(self, success: bool):
         attempts = self._get_attempts()
@@ -587,18 +707,30 @@ class USBProtection:
             self.attempts_file.unlink()
 
     def _self_destruct(self):
-        """Overwrite all encrypted backup files with random data."""
+        """Overwrite all encrypted backup files with random data, then unlink."""
         logger.critical(f"USB SELF-DESTRUCT triggered at {self.backup_path}")
         for f in self.backup_path.rglob("*.enc"):
             try:
                 size = f.stat().st_size
                 with open(f, "wb") as fh:
                     fh.write(os.urandom(size))
+                    fh.flush()
+                    os.fsync(fh.fileno())
                 f.unlink()
             except Exception:
                 logger.debug("Emergency lockout file cleanup failed: %s", f, exc_info=True)
-        # Remove the attempts file too
+        # Remove the attempts file and HMAC secret
         self._reset_attempts()
+        secret_file = self.backup_path / ".hmac_secret"
+        if secret_file.exists():
+            try:
+                with open(secret_file, "wb") as fh:
+                    fh.write(os.urandom(32))
+                    fh.flush()
+                    os.fsync(fh.fileno())
+                secret_file.unlink()
+            except Exception:
+                pass
 
 
 # ============================================================
