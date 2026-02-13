@@ -2422,8 +2422,7 @@ def api_stats():
 
 @app.route("/api/dataset/<int:n>/load", methods=["POST"])
 def api_dataset_load(n):
-    """Trigger dataset download.  The actual harvesting runs in a background thread;
-    progress is pushed over SocketIO."""
+    """Trigger dataset download via the real HarvesterEngine in a background thread."""
     if n < 1 or n > 12:
         return jsonify({"error": "Dataset must be 1-12"}), 400
 
@@ -2449,30 +2448,46 @@ def api_dataset_load(n):
     socketio.emit("progress", {"message": f"Dataset {n} download started...", "level": "info"})
     socketio.emit("dataset_progress", {"dataset": n, "percent": 0, "message": f"Initializing dataset {n}..."})
 
-    # In a real deployment, this would kick off the harvester pipeline in a background thread.
-    # For now we emit a completion event so the UI updates.
     def _background_load():
-        import time
-        steps = [
-            (10, "Connecting to DOJ source..."),
-            (30, "Downloading documents..."),
-            (60, "Verifying file integrity..."),
-            (80, "Indexing documents..."),
-            (100, "Dataset loaded successfully!"),
-        ]
-        for pct, msg in steps:
-            time.sleep(0.5)
-            socketio.emit("dataset_progress", {"dataset": n, "percent": pct, "message": msg})
-        conn2 = get_conn()
         try:
-            conn2.execute(
-                "UPDATE datasets SET status = 'downloaded', downloaded_at = ?, updated_at = ? WHERE dataset_number = ?",
-                (datetime.now(tz=timezone.utc).isoformat(), datetime.now(tz=timezone.utc).isoformat(), n),
-            )
-            conn2.commit()
-        finally:
-            conn2.close()
-        socketio.emit("progress", {"message": f"Dataset {n} loaded!", "level": "success"})
+            from harvester.harvester import HarvesterEngine
+
+            def harvester_progress(event):
+                msg = event.get("message", "")
+                pct = event.get("percent")
+                socketio.emit("dataset_progress", {
+                    "dataset": n,
+                    "percent": pct if pct is not None else 0,
+                    "message": msg,
+                })
+
+            engine = HarvesterEngine(progress_cb=harvester_progress)
+            paths = engine.download_dataset(n)
+
+            conn2 = get_conn()
+            try:
+                conn2.execute(
+                    "UPDATE datasets SET status = 'downloaded', downloaded_at = ?, updated_at = ? WHERE dataset_number = ?",
+                    (datetime.now(tz=timezone.utc).isoformat(), datetime.now(tz=timezone.utc).isoformat(), n),
+                )
+                conn2.commit()
+            finally:
+                conn2.close()
+
+            socketio.emit("dataset_progress", {"dataset": n, "percent": 100, "message": f"Dataset {n}: {len(paths)} files downloaded!"})
+            socketio.emit("progress", {"message": f"Dataset {n} loaded! {len(paths)} files.", "level": "success"})
+        except Exception as exc:
+            logger.exception("Dataset %d load failed", n)
+            conn2 = get_conn()
+            try:
+                conn2.execute(
+                    "UPDATE datasets SET status = 'error', updated_at = ? WHERE dataset_number = ?",
+                    (datetime.now(tz=timezone.utc).isoformat(), n),
+                )
+                conn2.commit()
+            finally:
+                conn2.close()
+            socketio.emit("progress", {"message": f"Dataset {n} load FAILED: {exc}", "level": "error"})
 
     socketio.start_background_task(_background_load)
     return jsonify({"status": "started", "dataset": n})
@@ -2480,6 +2495,10 @@ def api_dataset_load(n):
 
 @app.route("/api/dataset/<int:n>/process", methods=["POST"])
 def api_dataset_process(n):
+    """Trigger document processing via the real ProcessorEngine in a background thread."""
+    if n < 1 or n > 12:
+        return jsonify({"error": "Dataset must be 1-12"}), 400
+
     conn = get_conn()
     try:
         conn.execute(
@@ -2489,15 +2508,107 @@ def api_dataset_process(n):
         conn.commit()
     finally:
         conn.close()
+
     _get_db().log_action("dataset_process", f"Started processing dataset {n}")
     socketio.emit("progress", {"message": f"Processing dataset {n}...", "level": "info"})
+
+    def _background_process():
+        try:
+            from processor.processor import ProcessorEngine
+
+            def processor_progress(stage, current, total, message=""):
+                pct = int(current / total * 100) if total > 0 else 0
+                socketio.emit("dataset_progress", {
+                    "dataset": n,
+                    "percent": pct,
+                    "message": f"{stage}: {current}/{total} {message}".strip(),
+                })
+
+            engine = ProcessorEngine(progress_cb=processor_progress)
+            engine.db.initialize()
+            result = engine.process_dataset(n)
+
+            conn2 = get_conn()
+            try:
+                conn2.execute(
+                    "UPDATE datasets SET status = 'processed', updated_at = ? WHERE dataset_number = ?",
+                    (datetime.now(tz=timezone.utc).isoformat(), n),
+                )
+                conn2.commit()
+            finally:
+                conn2.close()
+
+            total_docs = result.get("total", 0)
+            errors = result.get("errors", 0)
+            socketio.emit("dataset_progress", {"dataset": n, "percent": 100, "message": f"Processing complete! {total_docs} docs, {errors} errors"})
+            socketio.emit("progress", {"message": f"Dataset {n} processed! {total_docs} documents.", "level": "success"})
+        except Exception as exc:
+            logger.exception("Dataset %d processing failed", n)
+            conn2 = get_conn()
+            try:
+                conn2.execute(
+                    "UPDATE datasets SET status = 'error', updated_at = ? WHERE dataset_number = ?",
+                    (datetime.now(tz=timezone.utc).isoformat(), n),
+                )
+                conn2.commit()
+            finally:
+                conn2.close()
+            socketio.emit("progress", {"message": f"Dataset {n} processing FAILED: {exc}", "level": "error"})
+
+    socketio.start_background_task(_background_process)
     return jsonify({"status": "processing", "dataset": n})
 
 
 @app.route("/api/dataset/<int:n>/analyze", methods=["POST"])
 def api_dataset_analyze(n):
+    """Trigger AI analysis via the real PipelineEngine in a background thread."""
+    if n < 1 or n > 12:
+        return jsonify({"error": "Dataset must be 1-12"}), 400
+
     _get_db().log_action("dataset_analyze", f"Started AI analysis on dataset {n}")
     socketio.emit("progress", {"message": f"AI analysis started for dataset {n}...", "level": "info"})
+
+    def _background_analyze():
+        try:
+            from ai_pipeline.pipeline import PipelineEngine
+
+            engine = PipelineEngine()
+
+            def pipeline_progress(current, total, doc_id, status):
+                pct = round(current / total * 100) if total else 0
+                socketio.emit("dataset_progress", {
+                    "dataset": n,
+                    "percent": pct,
+                    "message": f"[{current}/{total}] Document {doc_id}: {status}",
+                })
+
+            engine.progress_callback = pipeline_progress
+            results = engine.analyze_dataset(n)
+
+            if not results:
+                socketio.emit("progress", {"message": f"Dataset {n}: no documents to analyze.", "level": "warning"})
+                return
+
+            successes = sum(1 for r in results if "error" not in r.get("result", {}))
+            errors = len(results) - successes
+
+            conn2 = get_conn()
+            try:
+                conn2.execute(
+                    "UPDATE datasets SET status = 'analyzed', updated_at = ? WHERE dataset_number = ?",
+                    (datetime.now(tz=timezone.utc).isoformat(), n),
+                )
+                conn2.commit()
+            finally:
+                conn2.close()
+
+            socketio.emit("dataset_progress", {"dataset": n, "percent": 100, "message": f"Analysis complete! {successes} succeeded, {errors} failed"})
+            socketio.emit("progress", {"message": f"Dataset {n} analyzed! {successes} succeeded, {errors} failed.", "level": "success"})
+        except Exception as exc:
+            logger.exception("Dataset %d analysis failed", n)
+            socketio.emit("progress", {"message": f"Dataset {n} analysis FAILED: {exc}", "level": "error"})
+
+    socketio.start_background_task(_background_analyze)
     return jsonify({"status": "analyzing", "dataset": n})
 
 
