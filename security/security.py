@@ -317,6 +317,7 @@ class HoneypotManager:
     def create_honeypots(self):
         """Create convincing-looking decoy files."""
         honeypot_dir = self.data_dir / "findings"  # Hide among real findings
+        honeypot_dir.mkdir(parents=True, exist_ok=True)
 
         for name in self.HONEYPOT_NAMES:
             path = honeypot_dir / name

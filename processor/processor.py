@@ -1977,7 +1977,7 @@ class ImageForensics:
                         value = str(value)
                     exif_dict[tag_name] = value
         except Exception:
-            logger.debug("EXIF extraction failed", exc_info=True)
+            log.debug("EXIF extraction failed", exc_info=True)
         return exif_dict
 
 
@@ -2097,10 +2097,20 @@ class EmailChainStitcher:
             if row:
                 return {"chain_id": row["id"], "match_type": "exact_hash"}
 
-            # Second: fuzzy match - check all chains
-            chains = conn.execute(
-                "SELECT id, chain_identifier, normalized_subject, participants FROM email_chains"
-            ).fetchall()
+            # Second: fuzzy match - filter by subject similarity at the SQL level
+            # to avoid loading the entire email_chains table into memory
+            fp_subj = fingerprint["normalized_subject"]
+            subj_like = "%" + fp_subj[:40].replace("%", "").replace("_", "") + "%" if fp_subj else None
+            if subj_like:
+                chains = conn.execute(
+                    "SELECT id, chain_identifier, normalized_subject, participants "
+                    "FROM email_chains WHERE normalized_subject LIKE ? ESCAPE '\\'",
+                    (subj_like,),
+                ).fetchall()
+            else:
+                chains = conn.execute(
+                    "SELECT id, chain_identifier, normalized_subject, participants FROM email_chains"
+                ).fetchall()
 
             for chain in chains:
                 match_score = 0
@@ -2414,8 +2424,25 @@ class EmailChainStitcher:
             "%d-%b-%y",
         ]
 
-        # Strip timezone abbreviations like "EST", "PST" but preserve AM/PM
-        cleaned = re.sub(r"\s+\(?(?!(?:AM|PM)\b)[A-Z]{2,5}\)?\s*$", "", date_str)
+        # Map common timezone abbreviations to UTC offsets before stripping
+        _tz_offsets = {
+            "EST": "-0500", "EDT": "-0400", "CST": "-0600", "CDT": "-0500",
+            "MST": "-0700", "MDT": "-0600", "PST": "-0800", "PDT": "-0700",
+            "GMT": "+0000", "UTC": "+0000", "BST": "+0100", "CET": "+0100",
+            "CEST": "+0200", "JST": "+0900", "AEST": "+1000", "AEDT": "+1100",
+        }
+        cleaned = date_str
+        tz_match = re.search(r"\s+\(?([A-Z]{2,5})\)?\s*$", cleaned)
+        if tz_match:
+            abbrev = tz_match.group(1)
+            if abbrev not in ("AM", "PM"):
+                offset = _tz_offsets.get(abbrev)
+                if offset:
+                    # Replace abbreviation with numeric offset so strptime %z works
+                    cleaned = cleaned[:tz_match.start()] + " " + offset
+                else:
+                    # Unknown abbreviation — strip it (best-effort, treat as UTC)
+                    cleaned = cleaned[:tz_match.start()]
 
         for fmt in formats:
             try:

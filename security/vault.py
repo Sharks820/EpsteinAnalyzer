@@ -545,14 +545,49 @@ class DashboardAuth:
         self.app = app
         self.key_manager = key_manager
         self.config = config
-        self._failed_attempts = 0
-        self._lockout_until = 0
         self._auto_lock_minutes = config.get("vault", {}).get("auto_lock_minutes", 15)
         self._max_attempts = config.get("vault", {}).get("max_login_attempts", 5)
+
+        # Persist lockout state to file so server restarts don't reset it
+        self._lockout_file = Path(config.get("project_root", ".")) / "config" / ".lockout"
+        self._failed_attempts, self._lockout_until = self._load_lockout()
 
         # Register middleware
         self.app.before_request(self._check_auth)
         self.app.after_request(self._add_security_headers)
+
+    def _load_lockout(self) -> tuple:
+        """Load persisted lockout state from disk."""
+        try:
+            if self._lockout_file.exists():
+                raw = self._lockout_file.read_bytes()
+                data = json.loads(raw)
+                return int(data.get("attempts", 0)), float(data.get("until", 0))
+        except Exception:
+            pass
+        return 0, 0
+
+    def _save_lockout(self):
+        """Persist lockout state to disk (HMAC-signed is overkill here,
+        the file is local and an attacker with disk access already won)."""
+        try:
+            self._lockout_file.parent.mkdir(parents=True, exist_ok=True)
+            self._lockout_file.write_text(json.dumps({
+                "attempts": self._failed_attempts,
+                "until": self._lockout_until,
+            }))
+        except Exception as e:
+            logger.debug("Could not persist lockout state: %s", e)
+
+    def _reset_lockout(self):
+        """Clear lockout counter on successful login."""
+        self._failed_attempts = 0
+        self._lockout_until = 0
+        try:
+            if self._lockout_file.exists():
+                self._lockout_file.unlink()
+        except Exception:
+            pass
 
     def _check_auth(self):
         """before_request handler: enforce authentication on all routes."""
@@ -609,13 +644,13 @@ class DashboardAuth:
                 remaining = int(self._lockout_until - now)
                 return False, None, f"Account locked. Try again in {remaining}s."
             # Lockout expired, reset
-            self._failed_attempts = 0
+            self._reset_lockout()
 
         try:
             mode, secure_key = self.key_manager.unlock(password)
 
             # Reset failed attempts on success
-            self._failed_attempts = 0
+            self._reset_lockout()
 
             # Rotate session ID
             session.clear()
@@ -637,8 +672,10 @@ class DashboardAuth:
             remaining = self._max_attempts - self._failed_attempts
             if self._failed_attempts >= self._max_attempts:
                 self._lockout_until = now + self.LOCKOUT_SECONDS
+                self._save_lockout()
                 logger.warning("Max login attempts reached, lockout engaged")
                 return False, None, "Account locked for 5 minutes."
+            self._save_lockout()
             logger.warning("Failed login attempt %d/%d", self._failed_attempts, self._max_attempts)
             return False, None, f"Invalid password. {remaining} attempts remaining."
 
@@ -884,42 +921,102 @@ class DatabaseVault:
         return self.key_manager.get_subkey(HKDF_DB_KEY)
 
     def decrypt_db(self) -> bool:
-        """Decrypt the database for use. Returns True if decrypted, False if no encrypted DB."""
+        """Decrypt the database for use. Returns True if decrypted, False if no encrypted DB.
+
+        Uses chunked AES-256-GCM with per-chunk AAD to avoid loading the
+        entire database into memory at once (prevents MemoryError on large DBs
+        and avoids paging plaintext to the swap file).
+        Writes to a temp file first, then atomically renames.
+        """
         if not self.enc_path.exists():
             return False
 
         key = self._get_db_key()
         aesgcm = AESGCM(key)
+        tmp_path = self.db_path.with_suffix(".db.tmp")
 
-        with open(self.enc_path, "rb") as fin:
-            nonce = fin.read(NONCE_SIZE)
-            ct = fin.read()
+        try:
+            with open(self.enc_path, "rb") as fin, open(tmp_path, "wb") as fout:
+                # Read header: magic(4) + version(1) + chunk_count(4)
+                magic = fin.read(4)
+                if magic != b"EADB":
+                    raise ValueError("Invalid encrypted DB: bad magic")
+                db_ver = struct.unpack("B", fin.read(1))[0]
+                chunk_count = struct.unpack(">I", fin.read(4))[0]
 
-        plaintext = aesgcm.decrypt(nonce, ct, b"database")
-        with open(self.db_path, "wb") as fout:
-            fout.write(plaintext)
+                for ci in range(chunk_count):
+                    nonce = fin.read(NONCE_SIZE)
+                    ct_len = struct.unpack(">I", fin.read(4))[0]
+                    ct = fin.read(ct_len)
+                    aad = f"EpsteinAnalyzer-db|{db_ver}|{ci}|{chunk_count}".encode()
+                    plaintext_chunk = aesgcm.decrypt(nonce, ct, aad)
+                    fout.write(plaintext_chunk)
+                    # Zero the plaintext chunk from memory
+                    ba = bytearray(plaintext_chunk)
+                    for k in range(len(ba)):
+                        ba[k] = 0
+                    del ba, plaintext_chunk
+
+            os.replace(str(tmp_path), str(self.db_path))
+        except Exception:
+            try:
+                tmp_path.unlink()
+            except OSError:
+                pass
+            raise
 
         logger.info("Database decrypted for use")
         return True
 
     def encrypt_db(self):
-        """Encrypt the database and securely delete plaintext."""
+        """Encrypt the database and securely delete plaintext.
+
+        Uses chunked AES-256-GCM with per-chunk AAD and writes to a temp
+        file before atomically renaming.  This bounds memory usage and
+        prevents partial encrypted files on crash.
+        """
         if not self.db_path.exists():
             logger.warning("No database to encrypt")
             return
 
         key = self._get_db_key()
         aesgcm = AESGCM(key)
-        nonce = os.urandom(NONCE_SIZE)
 
-        with open(self.db_path, "rb") as fin:
-            plaintext = fin.read()
+        file_size = self.db_path.stat().st_size
+        if file_size == 0:
+            chunk_count = 0
+        else:
+            chunk_count = (file_size + CHUNK_SIZE - 1) // CHUNK_SIZE
 
-        ct = aesgcm.encrypt(nonce, plaintext, b"database")
+        tmp_enc = self.enc_path.with_suffix(".enc.tmp")
+        try:
+            with open(self.db_path, "rb") as fin, open(tmp_enc, "wb") as fout:
+                # Write header: magic(4) + version(1) + chunk_count(4)
+                fout.write(b"EADB")
+                fout.write(struct.pack("B", FILE_VERSION))
+                fout.write(struct.pack(">I", chunk_count))
 
-        with open(self.enc_path, "wb") as fout:
-            fout.write(nonce)
-            fout.write(ct)
+                ci = 0
+                while True:
+                    chunk = fin.read(CHUNK_SIZE)
+                    if not chunk:
+                        break
+                    aad = f"EpsteinAnalyzer-db|{FILE_VERSION}|{ci}|{chunk_count}".encode()
+                    nonce = os.urandom(NONCE_SIZE)
+                    ct = aesgcm.encrypt(nonce, chunk, aad)
+                    fout.write(nonce)
+                    fout.write(struct.pack(">I", len(ct)))
+                    fout.write(ct)
+                    ci += 1
+
+            # Atomic rename on success
+            os.replace(str(tmp_enc), str(self.enc_path))
+        except Exception:
+            try:
+                tmp_enc.unlink()
+            except OSError:
+                pass
+            raise
 
         # Securely delete plaintext DB and WAL/SHM
         for path in [self.db_path, self._wal_path, self._shm_path]:

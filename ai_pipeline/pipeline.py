@@ -318,14 +318,17 @@ class ModelRunner(ABC):
         """Test whether the CLI tool responds at all."""
         try:
             cmd = shutil.which(self.cli_command) or self.cli_command
-            # On Windows, .cmd/.bat files require shell=True to execute
-            use_shell = sys.platform == "win32" and cmd.lower().endswith((".cmd", ".bat"))
+            # On Windows, .cmd/.bat wrappers must run through cmd.exe,
+            # but we keep shell=False to avoid command-injection risk.
+            run_cmd = [cmd, "--help"]
+            if sys.platform == "win32" and cmd.lower().endswith((".cmd", ".bat")):
+                run_cmd = ["cmd.exe", "/c"] + run_cmd
             result = subprocess.run(
-                [cmd, "--help"],
+                run_cmd,
                 capture_output=True,
                 text=True,
                 timeout=15,
-                shell=use_shell,
+                shell=False,
             )
             return result.returncode in (0, 1, 2)  # --help may exit 1 or 2
         except FileNotFoundError:
@@ -358,7 +361,10 @@ class ModelRunner(ABC):
             # Resolve the executable path (handles Windows .cmd/.bat wrappers)
             resolved = shutil.which(cmd[0]) or cmd[0]
             cmd[0] = resolved
-            use_shell = sys.platform == "win32" and resolved.lower().endswith((".cmd", ".bat"))
+            # On Windows, .cmd/.bat wrappers must run through cmd.exe,
+            # but we keep shell=False to avoid command-injection risk.
+            if sys.platform == "win32" and resolved.lower().endswith((".cmd", ".bat")):
+                cmd = ["cmd.exe", "/c"] + cmd
             logger.info("Running %s  (timeout=%ds)", self.get_name(), timeout)
             start = time.monotonic()
 
@@ -370,7 +376,7 @@ class ModelRunner(ABC):
                     capture_output=True,
                     text=True,
                     timeout=timeout,
-                    shell=use_shell,
+                    shell=False,
                 )
             elapsed = time.monotonic() - start
             logger.info("%s completed in %.1fs (exit=%d)", self.get_name(), elapsed, result.returncode)
@@ -1778,12 +1784,20 @@ class PipelineEngine:
             return False
         if na == nb:
             return True
-        # Require at least 4 characters for substring matching to avoid
-        # false positives like "Al" matching "Alan Dershowitz"
-        if len(na) >= 4 and na in nb:
-            return True
-        if len(nb) >= 4 and nb in na:
-            return True
+        # Substring matching: require word-boundary alignment to avoid
+        # false positives like "Alan" matching "Evaluation".
+        # For short names (4-5 chars), require exact word boundary on both sides.
+        # For longer names (6+), simple substring is safe enough.
+        for short, long in [(na, nb), (nb, na)]:
+            if len(short) < 4:
+                continue
+            if short in long:
+                if len(short) <= 5:
+                    # Require word-boundary match (space or start/end of string)
+                    if re.search(r"(?:^|\s)" + re.escape(short) + r"(?:\s|$)", long):
+                        return True
+                else:
+                    return True
         return False
 
 

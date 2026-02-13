@@ -438,9 +438,6 @@ def inject_sidebar_data():
 def csrf_protect():
     """Validate CSRF token on all POST/PUT/DELETE requests."""
     if request.method in ("POST", "PUT", "DELETE"):
-        # Skip CSRF for login (has its own token in form)
-        if request.path == "/login":
-            return None
         # Check header first (AJAX), then form field
         token = request.headers.get("X-CSRF-Token") or request.form.get("csrf_token")
         expected = session.get("_csrf_token", "")
@@ -522,12 +519,8 @@ def login():
 
     if request.method == "POST":
         password = request.form.get("password", "")
-        # Validate CSRF token (constant-time comparison)
-        token = request.form.get("csrf_token", "")
-        expected_csrf = session.get("_csrf_token", "")
-        if not token or not hmac.compare_digest(token, expected_csrf):
-            error = "Invalid request. Please try again."
-        elif _vault_auth:
+        # CSRF is validated by the global csrf_protect() before_request handler
+        if _vault_auth:
             success, mode, message = _vault_auth.attempt_login(password)
             if success:
                 _vault_mode = mode
@@ -1033,25 +1026,32 @@ def document_viewer(doc_id):
         paragraphs = [p.strip() for p in text.split("\n\n") if p.strip()]
         for j, para in enumerate(paragraphs[:5]):  # Limit to 5 per page for performance
             # Apply entity highlighting (escape para first to prevent XSS)
-            # Sort entities longest-first so shorter names don't break longer ones
+            # Use single-pass regex alternation to avoid overlapping replacements
+            # that would corrupt the HTML (e.g. "Andrew" matching inside "Prince Andrew").
             highlighted = html.escape(para)
-            for el in sorted(entity_links, key=lambda e: len(e.get("entity_name", "")), reverse=True):
+            css_map = {
+                "person": "hl-person",
+                "organization": "hl-org",
+                "location": "hl-location",
+                "financial": "hl-financial",
+                "legal_case": "hl-legal",
+            }
+            # Build a lookup: escaped_name -> html link
+            entity_lookup = {}
+            for el in entity_links:
                 name = el.get("entity_name", "")
                 if not name:
                     continue
                 safe_name = html.escape(name)
-                if safe_name in highlighted:
+                if safe_name not in entity_lookup:
                     etype = el.get("entity_type", "person")
-                    css_map = {
-                        "person": "hl-person",
-                        "organization": "hl-org",
-                        "location": "hl-location",
-                        "financial": "hl-financial",
-                        "legal_case": "hl-legal",
-                    }
                     css = css_map.get(etype, "hl-person")
-                    link = f'<a href="/entity/{int(el["entity_id"])}" class="{css}">{safe_name}</a>'
-                    highlighted = highlighted.replace(safe_name, link)
+                    entity_lookup[safe_name] = f'<a href="/entity/{int(el["entity_id"])}" class="{css}">{safe_name}</a>'
+            if entity_lookup:
+                # Sort longest-first to build the alternation pattern
+                sorted_names = sorted(entity_lookup.keys(), key=len, reverse=True)
+                pattern = "|".join(re.escape(n) for n in sorted_names)
+                highlighted = re.sub(pattern, lambda m: entity_lookup[m.group(0)], highlighted)
             annotations.append({
                 "page": page["page_number"],
                 "para": j + 1,
