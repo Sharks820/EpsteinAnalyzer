@@ -17,14 +17,17 @@ import json
 import logging
 import os
 import re
+import signal
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import traceback
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -79,47 +82,121 @@ METADATA:
 {document_text}
 --- DOCUMENT TEXT END ---
 
-Analyze the document above and produce your findings in the EXACT section format
-shown below.  For each section header, write the header line exactly as shown,
-then your content underneath.  Do NOT omit any section -- if you have no data
-for a section, write "None identified." under it.
+You are an investigative analyst reviewing documents from the Jeffrey Epstein case.
+Analyze the document above with the mindset of a federal investigator building a
+prosecution case.  Produce your findings in the EXACT section format shown below.
+Write each header line exactly as shown, then your content underneath.
+If you have no data for a section, write "None identified." under it.
+
+IMPORTANT RULES:
+- Only extract REAL entities you can identify with reasonable confidence.
+  Ignore OCR artifacts, garbled text, and nonsense strings.
+- Distinguish between alleged perpetrators, witnesses, victims, and bystanders.
+- Treat allegations as allegations. Do not present unproven claims as established fact.
+- Ground every claim in specific text from the document.  Quote the source text.
+- Dates and locations are critical -- extract every one you can find.
 
 === SUMMARY ===
-Provide a 2-3 sentence plain-language summary of this document.
+Provide a 3-5 sentence investigative summary: What is this document? Who created it
+and when?  What is its significance to the Epstein case?  What would a prosecutor
+or investigator find most important here?
 
 === ENTITIES ===
-List every person, organisation, location, financial reference, and case reference
-you can identify.  For each entity use this format:
-- NAME | TYPE | IDENTIFYING DETAILS | SEARCH: https://www.google.com/search?q=ENCODED_NAME
+List every identifiable person, organisation, location, financial reference, aircraft,
+and case/docket reference.  Skip OCR garbage and unreadable fragments.
+For each entity use this format:
+- NAME | TYPE | ROLE IN DOCUMENT | IDENTIFYING DETAILS | SEARCH: https://www.google.com/search?q=ENCODED_NAME
+
+TYPE must be one of: person, organization, location, aircraft, financial, legal_case,
+contact_info, event
+ROLE IN DOCUMENT examples: sender, recipient, subject of testimony, witness,
+attorney, accused, victim, property owner, pilot, passenger, employer, etc.
+
+=== TIMELINE ===
+Extract every date, time, or time period mentioned or implied.  For each entry:
+- DATE/PERIOD | EVENT DESCRIPTION | ENTITIES INVOLVED | SOURCE QUOTE
+If no dates are found, infer approximate timeframes from context (e.g. letterhead
+dates, filing stamps, "last Tuesday", fiscal years).
+
+=== LOCATIONS ===
+Extract every geographic reference -- addresses, cities, countries, properties,
+islands, airports, flight routes.  For each:
+- LOCATION | TYPE (address/city/property/airport/route) | CONTEXT | CONNECTED ENTITIES
+
+=== FINANCIAL ===
+Extract every financial reference -- dollar amounts, account numbers, wire transfers,
+payments, invoices, salaries, gifts.  For each:
+- AMOUNT/REFERENCE | TYPE (payment/invoice/salary/gift/wire/account) | FROM | TO | DATE | PURPOSE
 
 === REDACTIONS ===
 For each redaction you can detect (blacked-out text, [REDACTED] markers, missing
-names, etc.) provide your top 5 candidates with confidence percentage and
-one-line reasoning:
+names, suspicious gaps) provide your top 5 candidates:
 REDACTION #N (context: "<surrounding text>"):
   1. CANDIDATE_NAME (XX%) - reasoning
   2. CANDIDATE_NAME (XX%) - reasoning
   ... up to 5
 
 === CONNECTIONS ===
-Map relationships between entities using this format:
-[Entity A] --relationship_type-- [Entity B] | evidence: "..."
+Map relationships between entities.  Focus on relationships that matter for an
+investigation: who communicated with whom, who paid whom, who traveled with whom,
+who employed whom, who witnessed what.
+Format: [Entity A] --relationship_type-- [Entity B] | evidence: "direct quote from doc"
 
 === EVIDENCE_SCORE ===
-For each person identified, assign an incrimination score from 0-100.
-Format: NAME | SCORE | JUSTIFICATION
+For each person identified, assign an investigative relevance score from 0-100
+using this rubric:
+  90-100: Direct evidence of criminal conduct (admissions, eyewitness testimony)
+  70-89:  Strong circumstantial evidence (financial flows to/from Epstein,
+          repeated travel to known locations, employment by Epstein)
+  50-69:  Moderate relevance (named in communications, present at events,
+          business dealings)
+  30-49:  Peripheral involvement (mentioned in passing, clerical role,
+          one-time contact)
+  10-29:  Minimal relevance (government officials in official capacity,
+          service providers with no suspicious activity)
+  0-9:    No investigative relevance (document authors, filing clerks)
+Format: NAME | SCORE | CATEGORY (perpetrator/facilitator/witness/victim/bystander) | JUSTIFICATION
 
 === CROSS_REFERENCES ===
-Note any connections to known cases, dates, locations, recurring patterns,
-or external events.  Use bullet points.
+Note connections to:
+- Known Epstein associates (Ghislaine Maxwell, Jean-Luc Brunel, etc.)
+- Known properties (Little St. James, Zorro Ranch, NYC townhouse, Paris apt, NM ranch)
+- Known aircraft (N908JE, N909JE, "Lolita Express")
+- Known legal proceedings (FL plea deal, SDNY case, Maxwell trial, civil suits)
+- Known victims or Jane Does
+- Any external events, dates, or patterns that correlate
+Use bullet points with specific document evidence.
 
 === FLAGS ===
-List anything unusual, suspicious, or notable about this document.
-Include formatting oddities, missing pages, suspicious timestamps, etc.
+Flag anything an investigator should pay special attention to:
+- Evidence of witness tampering, obstruction, or destruction of evidence
+- Inconsistencies with other known facts
+- Signs of coded language or euphemisms
+- Unusual financial patterns
+- Missing pages, altered dates, or document tampering
+- Names that appear to be pseudonyms or aliases
+- Any mention of minors or age-related references
 
 === CAREER_ROLES ===
-For each person, state their known role/title at the time of this document.
-Format: NAME | ROLE/TITLE | ORGANISATION | TIME PERIOD (if known)
+For each person, classify both role and relationship to Epstein.
+Format:
+NAME | ROLE/TITLE | ORGANISATION | TIME PERIOD (if known) |
+EMPLOYMENT_LINK_TYPE | CRIME_LINK_TYPE | EVIDENCE_QUOTE
+
+EMPLOYMENT_LINK_TYPE must be one of:
+- direct_employee_of_epstein
+- employee_of_vendor_or_contractor
+- independent_associate
+- government_or_law_enforcement_official
+- unknown
+
+CRIME_LINK_TYPE must be one of:
+- none_not_indicated
+- alleged_facilitator
+- alleged_procurement_of_minors
+- logistics_or_transport_support
+- financial_or_obstruction_support
+- unknown
 """
 
     _REDACTION_INFERENCE_TEMPLATE = """\
@@ -284,7 +361,11 @@ IMPORTANT RULES:
             return ""
         compressed = []
         for ent in known_entities[:200]:  # cap to avoid prompt explosion
-            parts = [ent.get("name", "?")]
+            name = ent.get("name", "?")
+            # Filter out OCR garbage before injecting into prompts
+            if ResponseParser._is_ocr_garbage(name):
+                continue
+            parts = [name]
             if ent.get("entity_type"):
                 parts.append(f"({ent['entity_type']})")
             if ent.get("role"):
@@ -292,6 +373,8 @@ IMPORTANT RULES:
             if ent.get("implication_score"):
                 parts.append(f"score={ent['implication_score']}")
             compressed.append(" ".join(parts))
+        if not compressed:
+            return ""
         graph_summary = "\n".join(f"  - {c}" for c in compressed)
         return (
             "KNOWN ENTITIES (find connections to these):\n"
@@ -306,9 +389,33 @@ IMPORTANT RULES:
 class ModelRunner(ABC):
     """Base class for CLI-based model runners."""
 
-    def __init__(self, cli_command: str, timeout: int = 300):
+    _TRANSIENT_ERROR_TOKENS = (
+        "rate limit",
+        "429",
+        "quota",
+        "too many requests",
+        "temporarily unavailable",
+        "timed out",
+        "timeout",
+        "connection reset",
+        "network",
+        "econnreset",
+        "service unavailable",
+    )
+
+    def __init__(
+        self,
+        cli_command: str,
+        timeout: int = 300,
+        extra_args: Optional[list[str]] = None,
+        max_retries: int = 0,
+        retry_backoff_seconds: float = 2.0,
+    ):
         self.cli_command = cli_command
         self.timeout = timeout
+        self.extra_args = extra_args or []
+        self.max_retries = max(0, int(max_retries))
+        self.retry_backoff_seconds = max(0.0, float(retry_backoff_seconds))
 
     @abstractmethod
     def get_name(self) -> str:
@@ -327,6 +434,8 @@ class ModelRunner(ABC):
                 run_cmd,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 timeout=15,
                 shell=False,
             )
@@ -357,47 +466,103 @@ class ModelRunner(ABC):
             tmp.write(prompt_text)
             tmp.close()
 
-            cmd = self._build_command(tmp.name)
-            # Resolve the executable path (handles Windows .cmd/.bat wrappers)
-            resolved = shutil.which(cmd[0]) or cmd[0]
-            cmd[0] = resolved
-            # On Windows, .cmd/.bat wrappers must run through cmd.exe,
-            # but we keep shell=False to avoid command-injection risk.
-            if sys.platform == "win32" and resolved.lower().endswith((".cmd", ".bat")):
-                cmd = ["cmd.exe", "/c"] + cmd
-            logger.info("Running %s  (timeout=%ds)", self.get_name(), timeout)
-            start = time.monotonic()
-
-            # Use stdin file handle instead of shell piping to avoid injection
-            with open(tmp.name, "r", encoding="utf-8") as stdin_fh:
-                result = subprocess.run(
-                    cmd,
-                    stdin=stdin_fh,
-                    capture_output=True,
-                    text=True,
-                    timeout=timeout,
-                    shell=False,
+            attempts = self.max_retries + 1
+            for attempt in range(1, attempts + 1):
+                cmd = self._build_command(tmp.name)
+                # Resolve the executable path (handles Windows .cmd/.bat wrappers)
+                resolved = shutil.which(cmd[0]) or cmd[0]
+                cmd[0] = resolved
+                # On Windows, .cmd/.bat wrappers must run through cmd.exe,
+                # but we keep shell=False to avoid command-injection risk.
+                if sys.platform == "win32" and resolved.lower().endswith((".cmd", ".bat")):
+                    cmd = ["cmd.exe", "/c"] + cmd
+                logger.info(
+                    "Running %s (attempt %d/%d, timeout=%ds)",
+                    self.get_name(),
+                    attempt,
+                    attempts,
+                    timeout,
                 )
-            elapsed = time.monotonic() - start
-            logger.info("%s completed in %.1fs (exit=%d)", self.get_name(), elapsed, result.returncode)
+                start = time.monotonic()
 
-            if result.returncode != 0:
+                # Use stdin file handle instead of shell piping to avoid injection
+                with open(tmp.name, "r", encoding="utf-8") as stdin_fh:
+                    child_env = os.environ.copy()
+                    # Keep CLI child processes on UTF-8 across Windows shells/tools.
+                    child_env.setdefault("PYTHONUTF8", "1")
+                    child_env.setdefault("PYTHONIOENCODING", "utf-8")
+                    child_env.setdefault("NO_COLOR", "1")
+                    popen_kwargs = {
+                        "stdin": stdin_fh,
+                        "stdout": subprocess.PIPE,
+                        "stderr": subprocess.PIPE,
+                        "text": True,
+                        "encoding": "utf-8",
+                        "errors": "replace",
+                        "shell": False,
+                        "env": child_env,
+                    }
+                    # Isolate child process groups so timeout cleanup can kill full trees.
+                    if sys.platform == "win32":
+                        popen_kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP
+                    else:
+                        popen_kwargs["start_new_session"] = True
+
+                    proc = subprocess.Popen(cmd, **popen_kwargs)
+                    try:
+                        stdout, stderr = proc.communicate(timeout=timeout)
+                    except subprocess.TimeoutExpired:
+                        self._kill_process_tree(proc)
+                        logger.error(
+                            "%s timed out after %ds (killed PID %s)",
+                            self.get_name(),
+                            timeout,
+                            proc.pid,
+                        )
+                        if attempt < attempts:
+                            self._sleep_before_retry(attempt)
+                            continue
+                        return None
+
+                    result = subprocess.CompletedProcess(
+                        args=cmd,
+                        returncode=proc.returncode,
+                        stdout=stdout,
+                        stderr=stderr,
+                    )
+
+                elapsed = time.monotonic() - start
+                logger.info("%s completed in %.1fs (exit=%d)", self.get_name(), elapsed, result.returncode)
+
+                cleaned_stdout = self._clean_output(result.stdout or "")
                 stderr = (result.stderr or "").strip()
-                # Rate-limit detection (common patterns)
-                if any(tok in stderr.lower() for tok in ("rate limit", "429", "quota", "too many")):
-                    logger.warning("%s hit rate limit: %s", self.get_name(), stderr[:300])
+
+                if result.returncode != 0:
+                    lower_err = stderr.lower()
+                    if self._is_transient_error(lower_err):
+                        logger.warning("%s transient failure: %s", self.get_name(), stderr[:300])
+                        if attempt < attempts:
+                            self._sleep_before_retry(attempt)
+                            continue
+                    logger.warning("%s exited %d: %s", self.get_name(), result.returncode, stderr[:500])
+                    # Still try to use stdout if there is content
+                    if cleaned_stdout and len(cleaned_stdout) > 50:
+                        return cleaned_stdout
+                    if attempt < attempts and self._is_transient_error((cleaned_stdout + "\n" + lower_err).lower()):
+                        self._sleep_before_retry(attempt)
+                        continue
                     return None
-                logger.warning("%s exited %d: %s", self.get_name(), result.returncode, stderr[:500])
-                # Still try to use stdout if there is content
-                if result.stdout and len(result.stdout.strip()) > 50:
-                    return result.stdout.strip()
+
+                if cleaned_stdout:
+                    return cleaned_stdout
+
+                # Empty response despite success exit code: retry for flaky CLIs.
+                if attempt < attempts:
+                    logger.warning("%s returned empty output; retrying", self.get_name())
+                    self._sleep_before_retry(attempt)
+                    continue
                 return None
 
-            return (result.stdout or "").strip() or None
-
-        except subprocess.TimeoutExpired:
-            logger.error("%s timed out after %ds", self.get_name(), timeout)
-            return None
         except FileNotFoundError:
             logger.error("%s CLI binary not found", self.get_name())
             return None
@@ -416,9 +581,59 @@ class ModelRunner(ABC):
                             chunk = min(remaining, 65536)
                             wf.write(os.urandom(chunk))
                             remaining -= chunk
+                except OSError:
+                    pass
+                try:
                     os.unlink(tmp.name)
                 except OSError:
                     pass
+
+    def _is_transient_error(self, text: str) -> bool:
+        if not text:
+            return False
+        return any(tok in text for tok in self._TRANSIENT_ERROR_TOKENS)
+
+    def _sleep_before_retry(self, attempt: int) -> None:
+        delay = self.retry_backoff_seconds * (2 ** (attempt - 1))
+        if delay > 0:
+            time.sleep(delay)
+
+    @staticmethod
+    def _clean_output(text: str) -> str:
+        """Normalize CLI output by removing ANSI noise and outer code fences."""
+        if not text:
+            return ""
+        # Strip ANSI escape sequences.
+        text = re.sub(r"\x1b\[[0-9;]*[A-Za-z]", "", text).strip()
+        if text.startswith("```") and text.endswith("```"):
+            lines = text.splitlines()
+            if len(lines) >= 3:
+                text = "\n".join(lines[1:-1]).strip()
+        return text
+
+    @staticmethod
+    def _kill_process_tree(proc: subprocess.Popen) -> None:
+        """Terminate a model process and all descendants."""
+        try:
+            if sys.platform == "win32":
+                subprocess.run(
+                    ["taskkill", "/PID", str(proc.pid), "/T", "/F"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                    shell=False,
+                )
+            else:
+                os.killpg(proc.pid, signal.SIGKILL)
+        except Exception:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
     @abstractmethod
     def _build_command(self, prompt_file: str) -> list[str]:
@@ -429,8 +644,21 @@ class ModelRunner(ABC):
 class CodexRunner(ModelRunner):
     """Runs prompts through the Codex CLI (codex exec for non-interactive)."""
 
-    def __init__(self, timeout: int = 300):
-        super().__init__("codex", timeout)
+    def __init__(
+        self,
+        cli_command: str = "codex",
+        timeout: int = 300,
+        extra_args: Optional[list[str]] = None,
+        max_retries: int = 0,
+        retry_backoff_seconds: float = 2.0,
+    ):
+        super().__init__(
+            cli_command,
+            timeout,
+            extra_args=extra_args,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+        )
 
     def get_name(self) -> str:
         return "codex"
@@ -438,40 +666,81 @@ class CodexRunner(ModelRunner):
     def _build_command(self, prompt_file: str) -> list[str]:
         # codex exec reads from stdin when prompt is "-"
         # -C sets working dir to project root (codex requires a git repo)
-        return ["codex", "exec", "-C", str(_PROJECT_ROOT), "-"]
+        # --ephemeral skips session persistence for faster execution
+        return [self.cli_command, "exec", "--ephemeral", "-C", str(_PROJECT_ROOT), "-"] + self.extra_args
 
 
 class GeminiRunner(ModelRunner):
     """Runs prompts through the Gemini CLI."""
 
-    def __init__(self, timeout: int = 300):
-        super().__init__("gemini", timeout)
+    def __init__(
+        self,
+        cli_command: str = "gemini",
+        timeout: int = 300,
+        extra_args: Optional[list[str]] = None,
+        max_retries: int = 1,
+        retry_backoff_seconds: float = 2.0,
+    ):
+        super().__init__(
+            cli_command,
+            timeout,
+            extra_args=extra_args,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+        )
 
     def get_name(self) -> str:
         return "gemini"
 
     def _build_command(self, prompt_file: str) -> list[str]:
-        return ["gemini", "-p", "-"]
+        # Default model produces complete output; flash truncates sections
+        return [self.cli_command, "-p", "-"] + self.extra_args
 
 
 class ClaudeRunner(ModelRunner):
     """Runs prompts through the Claude CLI (claude --print for non-interactive)."""
 
-    def __init__(self, timeout: int = 300):
-        super().__init__("claude", timeout)
+    def __init__(
+        self,
+        cli_command: str = "claude",
+        timeout: int = 300,
+        extra_args: Optional[list[str]] = None,
+        max_retries: int = 0,
+        retry_backoff_seconds: float = 2.0,
+    ):
+        super().__init__(
+            cli_command,
+            timeout,
+            extra_args=extra_args,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+        )
 
     def get_name(self) -> str:
         return "claude"
 
     def _build_command(self, prompt_file: str) -> list[str]:
-        return ["claude", "--print", "--model", "claude-sonnet-4-5-20250929"]
+        return [self.cli_command, "--print", "--model", "claude-sonnet-4-5-20250929"] + self.extra_args
 
 
 class KimiRunner(ModelRunner):
     """Runs prompts through the Kimi CLI (kimi --quiet for non-interactive)."""
 
-    def __init__(self, timeout: int = 300):
-        super().__init__("kimi", timeout)
+    def __init__(
+        self,
+        cli_command: str = "kimi",
+        timeout: int = 300,
+        extra_args: Optional[list[str]] = None,
+        max_retries: int = 1,
+        retry_backoff_seconds: float = 2.0,
+    ):
+        super().__init__(
+            cli_command,
+            timeout,
+            extra_args=extra_args,
+            max_retries=max_retries,
+            retry_backoff_seconds=retry_backoff_seconds,
+        )
 
     def get_name(self) -> str:
         return "kimi"
@@ -479,7 +748,7 @@ class KimiRunner(ModelRunner):
     def _build_command(self, prompt_file: str) -> list[str]:
         # --quiet = --print --output-format text --final-message-only
         # Uses default model from ~/.kimi/config.toml (kimi-code/kimi-for-coding)
-        return ["kimi", "--quiet"]
+        return [self.cli_command, "--quiet"] + self.extra_args
 
 
 # ===================================================================
@@ -493,6 +762,9 @@ class ResponseParser:
     _SECTIONS = [
         ("summary",              r"===\s*SUMMARY\s*==="),
         ("entities",             r"===\s*ENTITIES\s*==="),
+        ("timeline",             r"===\s*TIMELINE\s*==="),
+        ("locations",            r"===\s*LOCATIONS?\s*==="),
+        ("financial",            r"===\s*FINANCIAL\s*==="),
         ("redaction_inferences", r"===\s*REDACTIONS?\s*==="),
         ("connections",          r"===\s*CONNECTIONS?\s*==="),
         ("evidence_scores",      r"===\s*EVIDENCE[_ ]?SCORES?\s*==="),
@@ -516,6 +788,9 @@ class ResponseParser:
         parsed: dict[str, Any] = {}
         parsed["summary"] = self._parse_summary(sections_raw.get("summary"))
         parsed["entities"] = self._parse_entities(sections_raw.get("entities"))
+        parsed["timeline"] = self._parse_pipe_delimited(sections_raw.get("timeline"), ["date", "event", "entities_involved", "source_quote"])
+        parsed["locations"] = self._parse_pipe_delimited(sections_raw.get("locations"), ["location", "type", "context", "connected_entities"])
+        parsed["financial"] = self._parse_pipe_delimited(sections_raw.get("financial"), ["amount", "type", "from_entity", "to_entity", "date", "purpose"])
         parsed["redaction_inferences"] = self._parse_redactions(sections_raw.get("redaction_inferences"))
         parsed["connections"] = self._parse_connections(sections_raw.get("connections"))
         parsed["evidence_scores"] = self._parse_evidence_scores(sections_raw.get("evidence_scores"))
@@ -568,11 +843,64 @@ class ResponseParser:
         return text.strip()
 
     @staticmethod
+    def _is_ocr_garbage(name: str) -> bool:
+        """Detect OCR artifacts and garbage strings that aren't real entities."""
+        if not name or len(name.strip()) < 2:
+            return True
+        name = name.strip()
+        # Too short to be meaningful
+        if len(name) <= 2:
+            return True
+        # Contains embedded newlines (OCR artifact)
+        if "\n" in name or "\r" in name:
+            return True
+        # Looks like a document ID being treated as an entity
+        if re.match(r"^EFTA\d+$", name):
+            return True
+        # Mostly non-alphabetic characters (allow $ for financial)
+        alpha_ratio = sum(1 for c in name if c.isalpha()) / max(len(name), 1)
+        if alpha_ratio < 0.5 and not name.startswith("$"):
+            return True
+        # Excessive repeated characters (e.g. MINININININNNVNVNNVhVNN)
+        if re.search(r"(.)\1{4,}", name):
+            return True
+        # Repeated 2-char patterns (e.g. NINININI)
+        if re.search(r"(.{2})\1{3,}", name):
+            return True
+        # Contains control characters or unusual symbols (not common in names)
+        if re.search(r"[^\w\s.,'\-/&()#@$%:]", name) and not name.startswith("$"):
+            return True
+        # Contains underscores mid-word (OCR artifact like 9e_a_St)
+        if "_" in name and not any(w in name.lower() for w in ("u.s.", "u.k.", "d.c.")):
+            return True
+        # Nonsense consonant clusters unlikely in any real language (5+ consonants)
+        if re.search(r"[^aeiouAEIOU\s]{5,}", name):
+            return True
+        # Long strings with no vowels suggest OCR garbage
+        words = name.split()
+        for word in words:
+            clean = re.sub(r"[^a-zA-Z]", "", word)
+            if len(clean) >= 4 and not any(c in clean.lower() for c in "aeiouy"):
+                return True
+        # Names that are very long single "words" with no spaces (likely OCR run-together)
+        if len(words) == 1 and len(name) > 12:
+            return True
+        # Multiple words where most are not recognizable (high entropy garbage)
+        if len(words) >= 2:
+            odd_words = sum(1 for w in words if len(w) >= 4 and (
+                sum(1 for c in w.lower() if c in "aeiouy") / max(len(w), 1) < 0.15
+                or re.search(r"(.)\1{2,}", w)
+            ))
+            if odd_words >= len(words) * 0.5 and odd_words >= 2:
+                return True
+        return False
+
+    @staticmethod
     def _parse_entities(text: Optional[str]) -> Optional[list[dict]]:
         if not text or text.lower().startswith("none identified"):
             return None
         entities: list[dict] = []
-        # Expected format: - NAME | TYPE | DETAILS | SEARCH: url
+        # Expected format: - NAME | TYPE | ROLE | DETAILS | SEARCH: url
         for line in text.splitlines():
             line = line.strip().lstrip("-").lstrip("*").strip()
             if not line:
@@ -582,16 +910,42 @@ class ResponseParser:
             if len(parts) >= 1:
                 ent["name"] = parts[0]
             if len(parts) >= 2:
-                ent["type"] = parts[1]
+                ent["type"] = parts[1].lower().strip()
             if len(parts) >= 3:
-                ent["details"] = parts[2]
+                ent["role"] = parts[2]
             if len(parts) >= 4:
-                search_part = parts[3]
-                url_match = re.search(r"https?://\S+", search_part)
+                ent["details"] = parts[3]
+            # Search URL may be in parts[4] or parts[3]
+            for p in parts[3:]:
+                url_match = re.search(r"https?://\S+", p)
                 if url_match:
                     ent["search_url"] = url_match.group(0)
+                    break
+            # Filter OCR garbage
+            if ResponseParser._is_ocr_garbage(ent.get("name", "")):
+                continue
             entities.append(ent)
         return entities or None
+
+    @staticmethod
+    def _parse_pipe_delimited(text: Optional[str], field_names: list[str]) -> Optional[list[dict]]:
+        """Generic parser for pipe-delimited sections (timeline, locations, financial)."""
+        if not text or text.lower().startswith("none identified"):
+            return None
+        items: list[dict] = []
+        for line in text.splitlines():
+            line = line.strip().lstrip("-").lstrip("*").strip()
+            if not line:
+                continue
+            parts = [p.strip() for p in line.split("|")]
+            if len(parts) < 2:
+                continue
+            entry: dict[str, str] = {}
+            for idx, field in enumerate(field_names):
+                if idx < len(parts):
+                    entry[field] = parts[idx]
+            items.append(entry)
+        return items or None
 
     @staticmethod
     def _parse_redactions(text: Optional[str]) -> Optional[list[dict]]:
@@ -678,10 +1032,18 @@ class ResponseParser:
             parts = [p.strip() for p in line.split("|")]
             if len(parts) >= 2:
                 score_str = re.search(r"\d+", parts[1])
+                category = ""
+                justification = ""
+                if len(parts) >= 4:
+                    category = parts[2]
+                    justification = parts[3]
+                elif len(parts) >= 3:
+                    justification = parts[2]
                 scores.append({
                     "name": parts[0],
                     "score": int(score_str.group(0)) if score_str else 0,
-                    "justification": parts[2] if len(parts) >= 3 else "",
+                    "category": category,
+                    "justification": justification,
                 })
         return scores or None
 
@@ -724,6 +1086,12 @@ class ResponseParser:
                 entry["organization"] = parts[2]
             if len(parts) >= 4:
                 entry["time_period"] = parts[3]
+            if len(parts) >= 5:
+                entry["employment_link"] = parts[4]
+            if len(parts) >= 6:
+                entry["crime_link"] = parts[5]
+            if len(parts) >= 7:
+                entry["evidence_quote"] = parts[6]
             roles.append(entry)
         return roles or None
 
@@ -783,7 +1151,8 @@ class ConsensusEngine:
         )
 
         # ---- List-based fields ----
-        for field in ("entities", "connections", "cross_references", "flags", "career_roles"):
+        for field in ("entities", "connections", "cross_references", "flags", "career_roles",
+                       "timeline", "locations", "financial"):
             consensus[field] = self._merge_list_field(
                 field, analyses, model_names, disagreements, unique_insights
             )
@@ -1022,7 +1391,7 @@ class ConsensusEngine:
             if "source" in item and "target" in item:
                 return f"{item['source']}|{item.get('relationship', '')}|{item['target']}".lower()
             if "name" in item:
-                return item["name"].lower().strip()
+                return f"{item['name']}|{item.get('type', item.get('entity_type', ''))}".lower().strip()
             return json.dumps(item, sort_keys=True, default=str)
         return str(item).lower().strip()
 
@@ -1062,6 +1431,13 @@ class GracefulDegradation:
     def __init__(self, config: Optional[dict] = None):
         self.config = config or _load_config()
         self._runners: list[ModelRunner] = []
+        self._cache_lock = threading.Lock()
+        # Cache expensive CLI availability checks so batch runs stay fast.
+        self._availability_cache: Optional[dict[str, bool]] = None
+        self._availability_checked_at: float = 0.0
+        self._availability_cache_seconds = float(
+            self.config.get("ai_pipeline", {}).get("models_availability_cache_seconds", 120)
+        )
         self._build_runners()
 
     def _build_runners(self):
@@ -1071,22 +1447,49 @@ class GracefulDegradation:
             model_cfg = ai_cfg.get(key, {})
             if model_cfg.get("enabled", True):
                 timeout = model_cfg.get("timeout_seconds", 300)
-                self._runners.append(cls(timeout=timeout))
+                cli_command = model_cfg.get("cli_command", key)
+                extra_args = model_cfg.get("extra_args", [])
+                max_retries = model_cfg.get("max_retries", 0)
+                retry_backoff_seconds = model_cfg.get("retry_backoff_seconds", 2.0)
+                self._runners.append(
+                    cls(
+                        cli_command=cli_command,
+                        timeout=timeout,
+                        extra_args=extra_args,
+                        max_retries=max_retries,
+                        retry_backoff_seconds=retry_backoff_seconds,
+                    )
+                )
 
-    def check_all_models(self) -> dict[str, bool]:
+    def _get_model_status(self, force_refresh: bool = False) -> dict[str, bool]:
+        with self._cache_lock:
+            now = time.monotonic()
+            if (
+                not force_refresh
+                and self._availability_cache is not None
+                and (now - self._availability_checked_at) < self._availability_cache_seconds
+            ):
+                return dict(self._availability_cache)
+
+            status: dict[str, bool] = {}
+            for runner in self._runners:
+                avail = runner.check_available()
+                status[runner.get_name()] = avail
+                logger.info("Model %s: %s", runner.get_name(), "available" if avail else "unavailable")
+            self._availability_cache = dict(status)
+            self._availability_checked_at = now
+            return status
+
+    def check_all_models(self, force_refresh: bool = False) -> dict[str, bool]:
         """Return {model_name: available} for every configured runner."""
-        status = {}
-        for runner in self._runners:
-            avail = runner.check_available()
-            status[runner.get_name()] = avail
-            logger.info("Model %s: %s", runner.get_name(), "available" if avail else "unavailable")
-        return status
+        return self._get_model_status(force_refresh=force_refresh)
 
-    def get_available_runners(self) -> list[ModelRunner]:
+    def get_available_runners(self, force_refresh: bool = False) -> list[ModelRunner]:
         """Return only the runners whose CLI is currently reachable."""
+        status = self._get_model_status(force_refresh=force_refresh)
         available = []
         for runner in self._runners:
-            if runner.check_available():
+            if status.get(runner.get_name(), False):
                 available.append(runner)
         return available
 
@@ -1168,6 +1571,7 @@ class PipelineEngine:
         self.rate_limit_seconds = batch_cfg.get("rate_limit_seconds", 5)
         self.max_batch_size = batch_cfg.get("max_batch_size", 20)
         self.chain_aware = batch_cfg.get("chain_aware", True)
+        self.parallel_documents = max(1, int(batch_cfg.get("parallel_documents", 1)))
 
         # Optional progress callback: fn(current, total, document_id, status_msg)
         self.progress_callback: Optional[Callable] = None
@@ -1234,24 +1638,147 @@ class PipelineEngine:
         parsed_analyses: list[dict] = []
         model_names: list[str] = []
 
-        for runner in runners:
+        def _run_single_model(runner):
+            """Run a single model and return (name, response, elapsed)."""
+            name = runner.get_name()
             t0 = time.time()
             response = runner.run(prompt)
             elapsed = time.time() - t0
-            raw_responses[runner.get_name()] = response
+            return name, response, elapsed
 
-            if response:
-                parsed = self.parser.parse_response(response, runner.get_name())
-                # Save individual analysis to DB
-                self._save_analysis(document_id, runner.get_name(), parsed, response, elapsed)
-                parsed_analyses.append(parsed)
-                model_names.append(runner.get_name())
+        # --- Adaptive tiered confidence approach ---
+        # Stage 1: run Gemini+Kimi fast pair (if both available).
+        # Stage 2: if pair confidence/agreement is weak, escalate to slower models.
+        # Stage 3: if pair is unavailable, fall back to single-model fast-pass.
+        consensus_cfg = self.config.get("ai_pipeline", {}).get("consensus", {})
+        fast_pass_threshold = float(consensus_cfg.get("fast_pass_threshold", 0.88))
+        fast_pair_models = [
+            str(m).strip().lower()
+            for m in consensus_cfg.get("fast_pair_models", ["gemini", "kimi"])
+            if str(m).strip()
+        ]
+        pair_quality_threshold = float(consensus_cfg.get("pair_quality_threshold", 0.78))
+        pair_disagreement_max = int(consensus_cfg.get("pair_disagreement_max", 3))
+
+        # Sort runners by expected speed.
+        speed_order = {"gemini": 0, "kimi": 1, "claude": 2, "codex": 3}
+        runners_sorted = sorted(runners, key=lambda r: speed_order.get(r.get_name(), 99))
+        runner_by_name = {r.get_name(): r for r in runners_sorted}
+        fast_pair_runners: list[ModelRunner] = []
+        for model_name in fast_pair_models:
+            r = runner_by_name.get(model_name)
+            if r and r not in fast_pair_runners:
+                fast_pair_runners.append(r)
+            if len(fast_pair_runners) >= 2:
+                break
+
+        parsed_by_model: dict[str, dict] = {}
+
+        def _consume_result(name: str, response: Optional[str], elapsed: float) -> None:
+            raw_responses[name] = response
+            if not response:
+                logger.warning("No response from %s for document %d", name, document_id)
+                return
+            parsed = self.parser.parse_response(response, name)
+            self._save_analysis(document_id, name, parsed, response, elapsed)
+            parsed_analyses.append(parsed)
+            model_names.append(name)
+            parsed_by_model[name] = parsed
+
+        def _run_runner_group(group: list[ModelRunner]) -> None:
+            if not group:
+                return
+            if len(group) == 1:
+                name, response, elapsed = _run_single_model(group[0])
+                _consume_result(name, response, elapsed)
+                return
+            with ThreadPoolExecutor(max_workers=len(group)) as executor:
+                futures = {executor.submit(_run_single_model, r): r for r in group}
+                for future in as_completed(futures):
+                    name, response, elapsed = future.result()
+                    _consume_result(name, response, elapsed)
+
+        escalation_runners = [r for r in runners_sorted if r not in fast_pair_runners]
+        should_escalate = True
+
+        if len(fast_pair_runners) >= 2:
+            pair_names = [r.get_name() for r in fast_pair_runners]
+            logger.info("Running fast pair first for doc %d: %s", document_id, ", ".join(pair_names))
+            _run_runner_group(fast_pair_runners)
+
+            pair_available = [n for n in pair_names if n in parsed_by_model]
+            if len(pair_available) >= 2:
+                pair_analyses = [parsed_by_model[n] for n in pair_available]
+                pair_consensus = self.consensus_engine.merge_analyses(pair_analyses, pair_available)
+                pair_disagreements = len(pair_consensus.get("disagreements", []))
+                pair_agreement = pair_consensus.get("agreement_level", ConsensusEngine.SPLIT)
+                pair_qualities = [self._evaluate_response_quality(parsed_by_model[n]) for n in pair_available]
+                pair_min_quality = min(pair_qualities)
+                pair_avg_quality = sum(pair_qualities) / len(pair_qualities)
+
+                should_escalate = not (
+                    pair_agreement in (ConsensusEngine.FULL_AGREEMENT, ConsensusEngine.MAJORITY)
+                    and pair_min_quality >= pair_quality_threshold
+                    and pair_disagreements <= pair_disagreement_max
+                )
+                logger.info(
+                    "Fast pair doc %d: agreement=%s, min_quality=%.0f%%, avg_quality=%.0f%%, disagreements=%d, escalate=%s",
+                    document_id,
+                    pair_agreement,
+                    pair_min_quality * 100,
+                    pair_avg_quality * 100,
+                    pair_disagreements,
+                    should_escalate,
+                )
+            elif len(pair_available) == 1:
+                # If only one fast model answered, reuse single-model fast-pass logic.
+                only = pair_available[0]
+                quality = self._evaluate_response_quality(parsed_by_model[only])
+                should_escalate = quality < fast_pass_threshold
+                logger.info(
+                    "%s solo quality=%.0f%% for doc %d (threshold=%d%%) -> escalate=%s",
+                    only,
+                    quality * 100,
+                    document_id,
+                    int(fast_pass_threshold * 100),
+                    should_escalate,
+                )
             else:
-                logger.warning("No response from %s for document %d", runner.get_name(), document_id)
+                should_escalate = True
+        else:
+            # Fallback: single fastest model first.
+            primary_runner = runners_sorted[0]
+            _run_runner_group([primary_runner])
+            p_name = primary_runner.get_name()
+            if p_name in parsed_by_model:
+                quality = self._evaluate_response_quality(parsed_by_model[p_name])
+                should_escalate = quality < fast_pass_threshold
+                logger.info(
+                    "%s quality=%.0f%% for doc %d (threshold=%d%%) -> escalate=%s",
+                    p_name,
+                    quality * 100,
+                    document_id,
+                    int(fast_pass_threshold * 100),
+                    should_escalate,
+                )
+            else:
+                should_escalate = True
+            escalation_runners = [r for r in runners_sorted if r.get_name() != p_name]
 
-            # Rate limiting between model calls
-            if runner is not runners[-1]:
-                time.sleep(self.rate_limit_seconds)
+        if should_escalate and escalation_runners:
+            logger.info(
+                "Escalating doc %d to %d additional model(s): %s",
+                document_id,
+                len(escalation_runners),
+                ", ".join(r.get_name() for r in escalation_runners),
+            )
+            _run_runner_group(escalation_runners)
+        elif escalation_runners:
+            logger.info(
+                "Fast-tier accepted for doc %d — skipping %d slower model(s)",
+                document_id,
+                len(escalation_runners),
+            )
 
         # 6. Build consensus
         if not parsed_analyses:
@@ -1284,36 +1811,84 @@ class PipelineEngine:
     def analyze_batch(self, document_ids: list[int]) -> list[dict]:
         """Process multiple documents with progress tracking."""
         total = len(document_ids)
-        results: list[dict] = []
+        if total == 0:
+            return []
 
         # If chain-aware, reorder so email chains are grouped
         if self.chain_aware:
             document_ids = self._order_by_chains(document_ids)
 
-        for idx, doc_id in enumerate(document_ids, 1):
+        workers = max(1, min(self.parallel_documents, total))
+        if workers == 1:
+            results: list[dict] = []
+            for idx, doc_id in enumerate(document_ids, 1):
+                if self.progress_callback:
+                    self.progress_callback(idx, total, doc_id, "starting")
+
+                try:
+                    result = self.analyze_document(doc_id)
+                    results.append({"document_id": doc_id, "result": result})
+                except Exception as exc:
+                    logger.error("Error analyzing document %d: %s", doc_id, exc)
+                    logger.debug(traceback.format_exc())
+                    results.append({"document_id": doc_id, "error": str(exc)})
+
+                if self.progress_callback:
+                    status = "error" if "error" in results[-1] else "complete"
+                    self.progress_callback(idx, total, doc_id, status)
+
+                # Configurable inter-document cooldown for CLI/API stability.
+                if idx < total:
+                    time.sleep(max(0.0, float(self.rate_limit_seconds)))
+            return results
+
+        logger.info("Parallel document analysis enabled: workers=%d total_docs=%d", workers, total)
+        progress_lock = threading.Lock()
+        completed = 0
+        results_by_index: dict[int, dict] = {}
+
+        def _run_one(index: int, doc_id: int):
+            nonlocal completed
             if self.progress_callback:
-                self.progress_callback(idx, total, doc_id, "starting")
+                with progress_lock:
+                    start_pos = max(1, completed + 1)
+                self.progress_callback(start_pos, total, doc_id, "starting")
 
             try:
                 result = self.analyze_document(doc_id)
-                results.append({"document_id": doc_id, "result": result})
+                out = {"document_id": doc_id, "result": result}
             except Exception as exc:
                 logger.error("Error analyzing document %d: %s", doc_id, exc)
                 logger.debug(traceback.format_exc())
-                results.append({"document_id": doc_id, "error": str(exc)})
+                out = {"document_id": doc_id, "error": str(exc)}
+
+            with progress_lock:
+                completed += 1
+                done_pos = completed
 
             if self.progress_callback:
-                status = "error" if "error" in results[-1] else "complete"
-                self.progress_callback(idx, total, doc_id, status)
+                status = "error" if "error" in out else "complete"
+                self.progress_callback(done_pos, total, doc_id, status)
 
-            # Rate limit between documents
-            if idx < total:
-                time.sleep(self.rate_limit_seconds)
+            # Keep a short post-doc cooldown option for rate-limited providers.
+            if done_pos < total and float(self.rate_limit_seconds) > 0:
+                time.sleep(max(0.0, float(self.rate_limit_seconds)))
 
-        return results
+            return index, out
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_run_one, idx, doc_id) for idx, doc_id in enumerate(document_ids)]
+            for future in as_completed(futures):
+                index, out = future.result()
+                results_by_index[index] = out
+
+        return [results_by_index[idx] for idx in range(total)]
 
     def analyze_dataset(self, dataset_number: int) -> list[dict]:
         """Analyze all priority-queued documents in a dataset."""
+        # Recover stale in-flight jobs from crashed or hung runs.
+        self._recover_stuck_documents(dataset_number)
+
         conn = self.db.get_connection()
         try:
             rows = conn.execute("""
@@ -1321,8 +1896,8 @@ class PipelineEngine:
                 FROM documents d
                 JOIN datasets ds ON d.dataset_id = ds.id
                 WHERE ds.dataset_number = ?
-                  AND d.status IN ('ocr_complete', 'pending')
                   AND d.analysis_completed = 0
+                  AND d.status != 'analyzing'
                 ORDER BY d.priority_score DESC
                 LIMIT ?
             """, (dataset_number, self.max_batch_size)).fetchall()
@@ -1339,6 +1914,64 @@ class PipelineEngine:
             len(doc_ids), dataset_number,
         )
         return self.analyze_batch(doc_ids)
+
+    def _recover_stuck_documents(self, dataset_number: Optional[int] = None) -> int:
+        """Reset stale analyzing docs so they can be retried."""
+        stale_minutes = (
+            self.config.get("ai_pipeline", {})
+            .get("batch", {})
+            .get("stuck_reset_minutes", 15)
+        )
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=stale_minutes)
+
+        conn = self.db.get_connection()
+        try:
+            if dataset_number is None:
+                rows = conn.execute("""
+                    SELECT id, updated_at
+                    FROM documents
+                    WHERE status = 'analyzing' AND analysis_completed = 0
+                """).fetchall()
+            else:
+                rows = conn.execute("""
+                    SELECT d.id, d.updated_at
+                    FROM documents d
+                    JOIN datasets ds ON d.dataset_id = ds.id
+                    WHERE ds.dataset_number = ?
+                      AND d.status = 'analyzing'
+                      AND d.analysis_completed = 0
+                """, (dataset_number,)).fetchall()
+
+            stale_ids: list[int] = []
+            for row in rows:
+                try:
+                    updated = datetime.fromisoformat(row["updated_at"])
+                except Exception:
+                    stale_ids.append(row["id"])
+                    continue
+                if updated.tzinfo is None:
+                    updated = updated.replace(tzinfo=timezone.utc)
+                if updated < cutoff:
+                    stale_ids.append(row["id"])
+
+            if stale_ids:
+                placeholders = ",".join("?" for _ in stale_ids)
+                params = [datetime.now(timezone.utc).isoformat(), *stale_ids]
+                conn.execute(
+                    f"UPDATE documents "
+                    f"SET status = 'ocr_complete', updated_at = ? "
+                    f"WHERE id IN ({placeholders})",
+                    params,
+                )
+                conn.commit()
+                logger.warning(
+                    "Recovered %d stale analyzing document(s): %s",
+                    len(stale_ids),
+                    stale_ids,
+                )
+            return len(stale_ids)
+        finally:
+            conn.close()
 
     # ------------------------------------------------------------------
     # DB helpers
@@ -1422,6 +2055,41 @@ class PipelineEngine:
             return [dict(r) for r in rows]
         finally:
             conn.close()
+
+    @staticmethod
+    def _evaluate_response_quality(parsed: dict) -> float:
+        """Score how complete/confident a single model's parsed response is (0.0-1.0).
+
+        Checks: did the model produce a summary, entities, connections, evidence
+        scores, and other sections?  A high score means the response is rich
+        enough to stand on its own without needing consensus from other models.
+        """
+        score = 0.0
+        weights = {
+            "summary": 0.10,
+            "entities": 0.15,
+            "timeline": 0.10,
+            "locations": 0.05,
+            "financial": 0.05,
+            "connections": 0.15,
+            "evidence_scores": 0.15,
+            "redaction_inferences": 0.08,
+            "cross_references": 0.05,
+            "flags": 0.05,
+            "career_roles": 0.07,
+        }
+        for key, weight in weights.items():
+            val = parsed.get(key)
+            if val is None:
+                continue
+            if isinstance(val, str) and val:
+                score += weight  # summary
+            elif isinstance(val, list) and len(val) > 0:
+                # More items = higher sub-score (capped at 1.0 of the weight)
+                # e.g. 5+ entities = full credit, 1 entity = partial
+                fullness = min(len(val) / 3.0, 1.0)
+                score += weight * fullness
+        return min(score, 1.0)
 
     def _update_doc_status(self, document_id: int, status: str):
         conn = self.db.get_connection()
@@ -1567,6 +2235,13 @@ class PipelineEngine:
                     "SELECT id FROM entities WHERE canonical_name = ? AND entity_type = ?",
                     (canonical, etype),
                 ).fetchone()
+                if existing is None:
+                    # Fallback: look up by name if canonical mismatch
+                    existing = conn.execute(
+                        "SELECT id FROM entities WHERE name = ?", (name,)
+                    ).fetchone()
+                if existing is None:
+                    continue
                 eid = existing["id"]
 
                 entity_id_map[canonical.lower()] = eid
@@ -1833,7 +2508,7 @@ def main():
     if args.check_models:
         config = _load_config(args.config)
         degradation = GracefulDegradation(config)
-        status = degradation.check_all_models()
+        status = degradation.check_all_models(force_refresh=True)
         print("\n=== AI Model Availability ===")
         for name, avail in status.items():
             icon = "[OK]" if avail else "[UNAVAILABLE]"
