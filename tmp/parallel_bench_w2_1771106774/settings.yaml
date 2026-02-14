@@ -1,14 +1,13 @@
 project:
   name: EpsteinAnalyzer
   version: 1.0.0
-  data_dir: ./data
+  data_dir: C:\Users\Conner\EpsteinAnalyzer\tmp\parallel_bench_w2_1771106774\data
   max_disk_gb: 500
   auto_compact_threshold: 0.78
 dashboard:
   host: 127.0.0.1
   port: 8080
   debug: false
-  # secret_key is now derived at runtime from the vault DEK (no hardcoded key)
 harvester:
   enabled_sources:
   - doj

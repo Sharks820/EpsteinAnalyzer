@@ -15,7 +15,7 @@ CREATE TABLE IF NOT EXISTS datasets (
     processed_files INTEGER DEFAULT 0,
     downloaded_at TIMESTAMP,
     processed_at TIMESTAMP,
-    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'downloading', 'downloaded', 'processing', 'processed', 'error')),
+    status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'downloading', 'downloaded', 'processing', 'processed', 'analyzing', 'analyzed', 'error')),
     size_bytes INTEGER DEFAULT 0,
     notes TEXT,
     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,

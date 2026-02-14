@@ -1,0 +1,461 @@
+{% extends "base.html" %}
+{% block title %}Spiderweb Graph V2 - EpsteinAnalyzer{% endblock %}
+
+{% block head %}
+<link rel="stylesheet" href="/static/css/graph-v2.css">
+<style>
+  /* Override base template for full-width graph */
+  .main {
+    padding: 0;
+    margin-left: 240px;
+    height: 100vh;
+    overflow: hidden;
+  }
+  
+  @media (max-width: 900px) {
+    .main { margin-left: 0; }
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+<div id="graph-v2-root" class="graph-v2-container">
+  <!-- Filter Panel (Left) -->
+  <aside class="filter-panel" id="filter-panel">
+    <h3>🔍 Filters</h3>
+    
+    <!-- Quick Presets -->
+    <div class="filter-presets">
+      <button class="preset-btn" data-preset="aircraft">
+        ✈️ Aircraft Connected
+      </button>
+      <button class="preset-btn" data-preset="high-signal">
+        ⚡ High Signal Only
+      </button>
+      <button class="preset-btn" data-preset="epstein-core">
+        🎯 Epstein Core Network
+      </button>
+      <button class="preset-btn" data-preset="clear">
+        ⟲ Reset All
+      </button>
+    </div>
+    
+    <!-- Entity Types -->
+    <div class="filter-group">
+      <label>Entity Types</label>
+      <div class="checkbox-list" id="entity-type-filters">
+        <label class="checkbox-label">
+          <input type="checkbox" value="person" checked>
+          <span class="type-dot person"></span>
+          Person
+          <span class="count" data-type="person">-</span>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" value="organization" checked>
+          <span class="type-dot organization"></span>
+          Organization
+          <span class="count" data-type="organization">-</span>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" value="location" checked>
+          <span class="type-dot location"></span>
+          Location
+          <span class="count" data-type="location">-</span>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" value="aircraft" checked>
+          <span class="type-dot aircraft"></span>
+          Aircraft
+          <span class="count" data-type="aircraft">-</span>
+        </label>
+        <label class="checkbox-label">
+          <input type="checkbox" value="financial" checked>
+          <span class="type-dot financial"></span>
+          Financial
+          <span class="count" data-type="financial">-</span>
+        </label>
+      </div>
+    </div>
+    
+    <!-- Score Range -->
+    <div class="filter-group">
+      <label>Implication Score: <span id="score-range-label">0 - 100</span></label>
+      <div class="range-slider">
+        <input type="range" id="min-score" min="0" max="100" value="0">
+        <input type="range" id="max-score" min="0" max="100" value="100">
+      </div>
+    </div>
+    
+    <!-- Aircraft Filter -->
+    <div class="filter-group">
+      <label class="checkbox-label highlight">
+        <input type="checkbox" id="aircraft-only">
+        <span>✈️ Aircraft-connected only</span>
+      </label>
+    </div>
+    
+    <!-- Search -->
+    <div class="filter-group">
+      <input type="search" id="search-filter" placeholder="Search entities..." style="width: 100%;">
+    </div>
+    
+    <!-- Stats -->
+    <div class="filter-stats">
+      Showing <span id="filtered-count">-</span> of <span id="total-count">-</span> entities
+    </div>
+  </aside>
+  
+  <!-- Graph Canvas (Center) -->
+  <main class="graph-canvas-container" id="graph-canvas">
+    <!-- Toolbar -->
+    <div class="graph-toolbar">
+      <div class="toolbar-group">
+        <button class="btn" id="btn-reset-zoom" title="Reset Zoom">
+          ⌖ Reset View
+        </button>
+        <button class="btn" id="btn-center-epstein" title="Center on Epstein">
+          🎯 Center Epstein
+        </button>
+      </div>
+      <div class="toolbar-group">
+        <button class="btn" id="btn-export" title="Export Image">
+          💾 Export
+        </button>
+        <button class="btn" id="btn-fullscreen" title="Fullscreen">
+          ⛶ Fullscreen
+        </button>
+      </div>
+    </div>
+    
+    <!-- Legend -->
+    <div class="graph-legend">
+      <h4>Legend</h4>
+      <div class="legend-item">
+        <span class="legend-color" style="background: #e63946;"></span>
+        Person
+      </div>
+      <div class="legend-item">
+        <span class="legend-color" style="background: #457b9d;"></span>
+        Organization
+      </div>
+      <div class="legend-item">
+        <span class="legend-color" style="background: #2a9d8f;"></span>
+        Location
+      </div>
+      <div class="legend-item">
+        <span class="legend-color" style="background: #e9c46a;"></span>
+        Aircraft
+      </div>
+      <div class="legend-item">
+        <span class="legend-icon">✈️</span>
+        = Aircraft-connected
+      </div>
+      <div class="legend-item">
+        <span class="legend-icon">⭐</span>
+        = Epstein (center)
+      </div>
+    </div>
+    
+    <!-- Status -->
+    <div class="graph-status" id="graph-status">
+      Loading...
+    </div>
+    
+    <!-- D3 Graph will be rendered here -->
+  </main>
+  
+  <!-- Node Card Panel (Right) -->
+  <aside class="node-card-panel" id="node-card-panel">
+    <div class="node-card-empty">
+      <div class="empty-icon">🔍</div>
+      <p>Click on a node to view detailed analysis</p>
+    </div>
+  </aside>
+</div>
+{% endblock %}
+
+{% block scripts %}
+<!-- D3.js -->
+<script src="/static/d3.v7.min.js"></script>
+
+<!-- Graph Components -->
+<script src="/static/js/graph/spiderweb-graph.js"></script>
+<script src="/static/js/graph/node-card-panel.js"></script>
+
+<script>
+(function() {
+  'use strict';
+  
+  // State
+  let graph = null;
+  let cardPanel = null;
+  let filterState = {
+    entityTypes: ['person', 'organization', 'location', 'aircraft', 'financial'],
+    minScore: 0,
+    maxScore: 100,
+    aircraftOnly: false,
+    search: ''
+  };
+  
+  // Initialize
+  document.addEventListener('DOMContentLoaded', init);
+  
+  function init() {
+    initGraph();
+    initCardPanel();
+    initFilters();
+    initToolbar();
+    loadFilterMetadata();
+    
+    // Initial graph load
+    loadGraphData();
+  }
+  
+  function initGraph() {
+    const container = document.getElementById('graph-canvas');
+    
+    graph = new SpiderwebGraph('graph-canvas', {
+      width: container.clientWidth,
+      height: container.clientHeight,
+      maxNodes: 800,
+      onNodeSelect: (node) => {
+        cardPanel.loadEntity(node.id);
+      },
+      onNodeHover: (node) => {
+        // Tooltip is handled internally
+      }
+    });
+    
+    // Listen for graph events
+    window.addEventListener('graph:dataLoaded', (e) => {
+      updateStatus(`Showing ${e.detail.nodeCount} nodes, ${e.detail.linkCount} links`);
+      document.getElementById('filtered-count').textContent = e.detail.nodeCount;
+    });
+  }
+  
+  function initCardPanel() {
+    cardPanel = new NodeCardPanel('node-card-panel', {
+      onViewDocument: (docId, page) => {
+        window.open(`/document/${docId}?page=${page}`, '_blank');
+      },
+      onViewEntity: (entityId) => {
+        graph.focusNode(entityId);
+        cardPanel.loadEntity(entityId);
+      },
+      onViewFlights: (entityId) => {
+        window.open(`/flights?entity_id=${entityId}`, '_blank');
+      }
+    });
+  }
+  
+  function initFilters() {
+    // Entity type checkboxes
+    document.querySelectorAll('#entity-type-filters input').forEach(cb => {
+      cb.addEventListener('change', () => {
+        filterState.entityTypes = Array.from(
+          document.querySelectorAll('#entity-type-filters input:checked')
+        ).map(el => el.value);
+        debouncedApplyFilters();
+      });
+    });
+    
+    // Score range sliders
+    const minScoreSlider = document.getElementById('min-score');
+    const maxScoreSlider = document.getElementById('max-score');
+    
+    function updateScoreRange() {
+      let min = parseInt(minScoreSlider.value);
+      let max = parseInt(maxScoreSlider.value);
+      
+      // Ensure min <= max
+      if (min > max) {
+        [min, max] = [max, min];
+      }
+      
+      filterState.minScore = min;
+      filterState.maxScore = max;
+      document.getElementById('score-range-label').textContent = `${min} - ${max}`;
+      debouncedApplyFilters();
+    }
+    
+    minScoreSlider.addEventListener('input', updateScoreRange);
+    maxScoreSlider.addEventListener('input', updateScoreRange);
+    
+    // Aircraft only checkbox
+    document.getElementById('aircraft-only').addEventListener('change', (e) => {
+      filterState.aircraftOnly = e.target.checked;
+      debouncedApplyFilters();
+    });
+    
+    // Search input
+    const searchInput = document.getElementById('search-filter');
+    searchInput.addEventListener('input', debounce(() => {
+      filterState.search = searchInput.value.trim();
+      debouncedApplyFilters();
+    }, 300));
+    
+    // Preset buttons
+    document.querySelectorAll('.preset-btn').forEach(btn => {
+      btn.addEventListener('click', () => applyPreset(btn.dataset.preset));
+    });
+  }
+  
+  function initToolbar() {
+    // Reset zoom
+    document.getElementById('btn-reset-zoom').addEventListener('click', () => {
+      graph.resetZoom();
+    });
+    
+    // Center on Epstein
+    document.getElementById('btn-center-epstein').addEventListener('click', () => {
+      // Find Epstein node and focus
+      const epsteinNode = graph.nodes.find(n => 
+        n.name.toLowerCase().includes('jeffrey') && 
+        n.name.toLowerCase().includes('epstein')
+      );
+      if (epsteinNode) {
+        graph.focusNode(epsteinNode.id);
+      }
+    });
+    
+    // Export
+    document.getElementById('btn-export').addEventListener('click', () => {
+      graph.exportImage();
+    });
+    
+    // Fullscreen
+    document.getElementById('btn-fullscreen').addEventListener('click', () => {
+      const container = document.getElementById('graph-v2-root');
+      if (!document.fullscreenElement) {
+        container.requestFullscreen?.() || container.webkitRequestFullscreen?.();
+      } else {
+        document.exitFullscreen?.() || document.webkitExitFullscreen?.();
+      }
+    });
+  }
+  
+  function applyPreset(preset) {
+    switch(preset) {
+      case 'aircraft':
+        filterState = {
+          ...filterState,
+          aircraftOnly: true,
+          minScore: 30,
+          entityTypes: ['person', 'organization']
+        };
+        break;
+        
+      case 'high-signal':
+        filterState = {
+          ...filterState,
+          minScore: 70,
+          maxScore: 100,
+          aircraftOnly: false
+        };
+        break;
+        
+      case 'epstein-core':
+        filterState = {
+          ...filterState,
+          minScore: 50,
+          entityTypes: ['person'],
+          aircraftOnly: true
+        };
+        break;
+        
+      case 'clear':
+        filterState = {
+          entityTypes: ['person', 'organization', 'location', 'aircraft', 'financial'],
+          minScore: 0,
+          maxScore: 100,
+          aircraftOnly: false,
+          search: ''
+        };
+        break;
+    }
+    
+    syncFilterUI();
+    loadGraphData();
+  }
+  
+  function syncFilterUI() {
+    // Sync checkboxes
+    document.querySelectorAll('#entity-type-filters input').forEach(cb => {
+      cb.checked = filterState.entityTypes.includes(cb.value);
+    });
+    
+    // Sync score sliders
+    document.getElementById('min-score').value = filterState.minScore;
+    document.getElementById('max-score').value = filterState.maxScore;
+    document.getElementById('score-range-label').textContent = 
+      `${filterState.minScore} - ${filterState.maxScore}`;
+    
+    // Sync aircraft checkbox
+    document.getElementById('aircraft-only').checked = filterState.aircraftOnly;
+    
+    // Sync search
+    document.getElementById('search-filter').value = filterState.search;
+  }
+  
+  function loadGraphData() {
+    updateStatus('Loading...');
+    graph.setFilter('minScore', filterState.minScore);
+    graph.setFilter('entityTypes', filterState.entityTypes);
+    graph.setFilter('aircraftOnly', filterState.aircraftOnly);
+    graph.setFilter('search', filterState.search);
+    graph.setFilter('maxNodes', 800);
+    graph.loadData('/api/graph/data');
+  }
+  
+  async function loadFilterMetadata() {
+    try {
+      const response = await fetch('/api/graph/filters/metadata');
+      const data = await response.json();
+      
+      // Update entity type counts
+      for (const [type, count] of Object.entries(data.entity_types)) {
+        const el = document.querySelector(`[data-type="${type}"]`);
+        if (el) el.textContent = count;
+      }
+      
+      document.getElementById('total-count').textContent = data.total_entities;
+    } catch (err) {
+      console.error('Failed to load filter metadata:', err);
+    }
+  }
+  
+  function updateStatus(message) {
+    document.getElementById('graph-status').textContent = message;
+  }
+  
+  // Debounced filter application
+  let filterTimeout;
+  function debouncedApplyFilters() {
+    clearTimeout(filterTimeout);
+    filterTimeout = setTimeout(loadGraphData, 150);
+  }
+  
+  function debounce(fn, ms) {
+    let timeout;
+    return function(...args) {
+      clearTimeout(timeout);
+      timeout = setTimeout(() => fn.apply(this, args), ms);
+    };
+  }
+  
+  // Keyboard shortcuts
+  document.addEventListener('keydown', (e) => {
+    // Escape clears selection
+    if (e.key === 'Escape') {
+      cardPanel.clear();
+    }
+    
+    // R resets zoom
+    if (e.key === 'r' || e.key === 'R') {
+      graph.resetZoom();
+    }
+  });
+  
+})();
+</script>
+{% endblock %}

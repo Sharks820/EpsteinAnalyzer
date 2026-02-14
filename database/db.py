@@ -61,6 +61,7 @@ class DatabaseManager:
         conn = self.get_connection()
         try:
             conn.executescript(schema_sql)
+            conn.execute("PRAGMA foreign_keys=ON")  # Re-enable after executescript resets it
             conn.commit()
             # Initialize disk usage tracking
             conn.execute(

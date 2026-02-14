@@ -1,0 +1,40 @@
+{
+  "timestamp_utc": "2026-02-14T22:09:34Z",
+  "doc_ids": [
+    53,
+    21
+  ],
+  "results": [
+    {
+      "parallel_documents": 1,
+      "docs_tested": 2,
+      "ok": 2,
+      "errors": 0,
+      "success_rate": 1.0,
+      "elapsed_seconds": 256.18,
+      "docs_per_min": 0.468,
+      "benchmark_data_dir": "C:\\Users\\Conner\\EpsteinAnalyzer\\tmp\\parallel_bench_w1_1771106518\\data"
+    },
+    {
+      "parallel_documents": 2,
+      "docs_tested": 2,
+      "ok": 2,
+      "errors": 0,
+      "success_rate": 1.0,
+      "elapsed_seconds": 94.69,
+      "docs_per_min": 1.267,
+      "benchmark_data_dir": "C:\\Users\\Conner\\EpsteinAnalyzer\\tmp\\parallel_bench_w2_1771106774\\data"
+    },
+    {
+      "parallel_documents": 3,
+      "docs_tested": 2,
+      "ok": 2,
+      "errors": 0,
+      "success_rate": 1.0,
+      "elapsed_seconds": 105.02,
+      "docs_per_min": 1.143,
+      "benchmark_data_dir": "C:\\Users\\Conner\\EpsteinAnalyzer\\tmp\\parallel_bench_w3_1771106869\\data"
+    }
+  ],
+  "recommended_parallel_documents": 2
+}

@@ -35,33 +35,13 @@ def check_prerequisites() -> dict:
     except (FileNotFoundError, subprocess.TimeoutExpired):
         results["tesseract"] = {"installed": False, "version": None}
 
-    # Codex CLI
-    try:
-        r = subprocess.run(["codex", "--version"], capture_output=True, text=True, timeout=10)
-        results["codex"] = {"installed": True, "version": r.stdout.strip()}
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        results["codex"] = {"installed": False, "version": None}
-
-    # Gemini CLI
-    try:
-        r = subprocess.run(["gemini", "--version"], capture_output=True, text=True, timeout=10)
-        results["gemini"] = {"installed": True, "version": r.stdout.strip()}
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        results["gemini"] = {"installed": False, "version": None}
-
-    # Claude CLI
-    try:
-        r = subprocess.run(["claude", "--version"], capture_output=True, text=True, timeout=10)
-        results["claude"] = {"installed": True, "version": r.stdout.strip()}
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        results["claude"] = {"installed": False, "version": None}
-
-    # Kimi CLI
-    try:
-        r = subprocess.run(["kimi", "--version"], capture_output=True, text=True, timeout=10)
-        results["kimi"] = {"installed": True, "version": r.stdout.strip()}
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        results["kimi"] = {"installed": False, "version": None}
+    # AI model CLIs — checked lazily at runtime by PipelineEngine,
+    # not at setup time (they can hang, recurse, or spam errors).
+    # Just check if the binaries exist on PATH without executing them.
+    for cli_name in ("codex", "gemini", "claude", "kimi"):
+        import shutil
+        found = shutil.which(cli_name) is not None
+        results[cli_name] = {"installed": found, "version": "on PATH" if found else None}
 
     # Git
     try:

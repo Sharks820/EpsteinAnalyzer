@@ -127,7 +127,7 @@ class SecureKey:
                 logger.debug("CryptProtectMemory failed (non-critical)")
 
     def _unprotect(self):
-        """Decrypt key in RAM."""
+        """Decrypt key in RAM. Raises RuntimeError on failure to prevent returning encrypted bytes."""
         if not self._protected or self._destroyed:
             return
         if sys.platform == "win32":
@@ -140,8 +140,12 @@ class SecureKey:
                 )
                 if result:
                     self._protected = False
-            except Exception:
-                logger.debug("CryptUnprotectMemory failed (non-critical)")
+                else:
+                    raise RuntimeError("CryptUnprotectMemory failed — key may be corrupted")
+            except RuntimeError:
+                raise
+            except Exception as e:
+                raise RuntimeError(f"CryptUnprotectMemory exception: {e}") from e
 
     def get(self) -> bytes:
         """Get the raw key bytes (temporarily decrypts if protected)."""
@@ -254,7 +258,11 @@ class KeyManager:
         # Lock file permissions (Windows: current user only)
         self._lock_permissions()
 
-        del master_dek, decoy_dek, master_kek, decoy_kek
+        # Zero intermediary key material (bytearray for mutable zeroing)
+        for _ba in (vault_data,):
+            for i in range(len(_ba)):
+                _ba[i] = 0
+        del master_dek, decoy_dek, master_kek, decoy_kek, hmac_key
 
         logger.info("Vault initialized at %s", self.vault_path)
 
@@ -327,7 +335,16 @@ class KeyManager:
             dek = decoy_dek
 
         if mode is None:
+            del master_kek, decoy_kek, master_dek, decoy_dek
             raise ValueError("Invalid password")
+
+        # Clean up intermediary key material
+        del master_kek, decoy_kek
+        # Zero the losing DEK reference
+        if mode == "master":
+            del decoy_dek
+        else:
+            del master_dek
 
         self._dek = SecureKey(dek)
         logger.info("Vault unlocked in %s mode", mode)
@@ -373,7 +390,10 @@ class KeyManager:
         with open(self.vault_path, "wb") as f:
             f.write(vault_data)
 
-        del decoy_dek
+        # Zero intermediary key material
+        for i in range(len(vault_data)):
+            vault_data[i] = 0
+        del master_dek, decoy_dek, master_kek, decoy_kek, hmac_key
         self._lock_permissions()
         logger.info("Vault passwords reset successfully")
 
@@ -622,9 +642,9 @@ class DashboardAuth:
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data:; "
             "connect-src 'self' ws: wss:; "
-            "frame-ancestors 'none'"
+            "frame-ancestors 'self'"
         )
-        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-Frame-Options"] = "SAMEORIGIN"
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
         response.headers["Pragma"] = "no-cache"

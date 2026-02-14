@@ -123,6 +123,15 @@ FINANCIAL_PATTERNS: List[re.Pattern] = [
     re.compile(r"invoice\s*(?:no\.?|number|#)?\s*[\w\-]+", re.I),
 ]
 
+INVESTIGATIVE_SIGNAL_PATTERNS: List[tuple[str, re.Pattern]] = [
+    ("minor_risk", re.compile(r"\b(minor|underage|schoolgirl|young girl|under\s*18)\b", re.I)),
+    ("recruitment", re.compile(r"\b(recruit(?:ed|ment|ing)?|procure(?:d|ment)?|find girls|bring girls)\b", re.I)),
+    ("travel_coordination", re.compile(r"\b(flight itinerary|manifest|tail number|charter flight|pickup|driver)\b", re.I)),
+    ("concealment", re.compile(r"\b(delete|destroy|wipe|burn(?:er)? phone|sealed|confidential settlement|non[- ]prosecution)\b", re.I)),
+    ("coercion", re.compile(r"\b(blackmail|threat(?:en|s|ened)?|intimidat(?:e|ion)|retaliat(?:e|ion))\b", re.I)),
+    ("cash_or_wire", re.compile(r"\b(cash payment|wire transfer|offshore account|shell company)\b", re.I)),
+]
+
 CASE_REF_PATTERN = re.compile(
     r"(?:No\.|Case|Docket|Cause)\s*(?:No\.?\s*)?(\d{1,4}[\-:](?:cv|cr|mc|mj|po)[\-:]\d{3,10}(?:[\-:]\w+)?)",
     re.I,
@@ -388,7 +397,7 @@ class DocumentClassifier:
 
     # Email header regex
     _EMAIL_HEADER_RE = re.compile(
-        r"(?:^|\n)\s*(?:From|To|Subject|Date|Sent|CC|BCC)\s*:\s*.+",
+        r"(?:^|\n)\s*(?:From|To|Subject|Date|Sent|CC|BCC|Reply-To|Message-ID)\s*(?::|-)\s*.+",
         re.I | re.M,
     )
     _FROM_RE = re.compile(r"(?:^|\n)\s*From\s*:\s*(.+)", re.I | re.M)
@@ -415,10 +424,26 @@ class DocumentClassifier:
 
         # Email: count header lines
         email_headers = self._EMAIL_HEADER_RE.findall(text)
+        if len(email_headers) >= 1:
+            scores["email"] += 20
         if len(email_headers) >= 2:
-            scores["email"] += 40
+            scores["email"] += 25
         if len(email_headers) >= 4:
             scores["email"] += 20
+        # Email fallback patterns for OCR'd headers and forwarded/reply chains.
+        unique_addresses = {a.lower() for a in EMAIL_ADDR_PATTERN.findall(text)}
+        if len(unique_addresses) >= 2:
+            scores["email"] += 18
+        if len(unique_addresses) >= 4:
+            scores["email"] += 10
+        if re.search(r"(?:^|\n)\s*(?:On .+ wrote:|[-]{2,}\s*Original Message\s*[-]{2,}|Forwarded message)", text, re.I | re.M):
+            scores["email"] += 12
+        if re.search(r"(?:^|\n)\s*Subject\s*(?::|-)\s*(?:re|fw|fwd)\s*:", text, re.I | re.M):
+            scores["email"] += 12
+        if re.search(r"(?:^|\n)\s*From\s+.+<[^>]+>", text, re.I | re.M):
+            scores["email"] += 8
+        if re.search(r"(?:^|\n)\s*To\s+.+<[^>]+>", text, re.I | re.M):
+            scores["email"] += 8
 
         # Deposition: Q&A pattern
         qa_matches = self._QA_RE.findall(text)
@@ -456,7 +481,7 @@ class DocumentClassifier:
 
         # Filename hints
         fname = metadata.get("filename", "").lower()
-        if "email" in fname or "mail" in fname:
+        if "email" in fname or "mail" in fname or fname.endswith(".eml") or fname.endswith(".msg"):
             scores["email"] += 10
         if "depo" in fname:
             scores["deposition"] += 10
@@ -492,6 +517,21 @@ class DocumentClassifier:
             m = pattern.search(txt)
             return m.group(1).strip() if m else None
 
+        def _split_addresses(raw: Optional[str]) -> list[str]:
+            if not raw:
+                return []
+            parts = [p.strip() for p in re.split(r"[;,]", raw) if p.strip()]
+            addresses: list[str] = []
+            seen_norm: set[str] = set()
+            for part in parts:
+                # Keep "Name <email>" intact but dedupe by normalized address/text.
+                m = EMAIL_ADDR_PATTERN.search(part)
+                normalized = (m.group(0) if m else part).lower()
+                if normalized and normalized not in seen_norm:
+                    seen_norm.add(normalized)
+                    addresses.append(part)
+            return addresses
+
         from_field = _first_match(self._FROM_RE, text)
         to_field = _first_match(self._TO_RE, text)
         cc_field = _first_match(self._CC_RE, text)
@@ -499,13 +539,17 @@ class DocumentClassifier:
         date_field = _first_match(self._DATE_RE, text)
 
         # Split To / CC into lists
-        to_list = [a.strip() for a in to_field.split(";") if a.strip()] if to_field else []
-        if not to_list and to_field:
-            to_list = [a.strip() for a in to_field.split(",") if a.strip()]
+        to_list = _split_addresses(to_field)
+        cc_list = _split_addresses(cc_field)
 
-        cc_list = [a.strip() for a in cc_field.split(";") if a.strip()] if cc_field else []
-        if not cc_list and cc_field:
-            cc_list = [a.strip() for a in cc_field.split(",") if a.strip()]
+        header_window = "\n".join((text or "").splitlines()[:80])
+        discovered_addresses = []
+        seen_addresses = set()
+        for addr in EMAIL_ADDR_PATTERN.findall(header_window):
+            key = addr.lower()
+            if key not in seen_addresses:
+                seen_addresses.add(key)
+                discovered_addresses.append(addr)
 
         # Extract body (everything after headers)
         body = text
@@ -527,6 +571,25 @@ class DocumentClassifier:
             if email_match:
                 from_address = email_match.group(0)
                 from_name = from_field.replace(from_address, "").strip(" <>\t\"'")
+        if not from_address and discovered_addresses:
+            from_address = discovered_addresses[0]
+            if not from_name:
+                from_name = discovered_addresses[0]
+        if not to_list and len(discovered_addresses) > 1:
+            # Fallback when OCR strips To:/CC: labels but preserves addresses.
+            to_list = discovered_addresses[1:8]
+        if not subject:
+            subj_hint = re.search(r"(?:^|\n)\s*((?:Re|FW|Fwd)\s*:\s*.+)$", header_window, re.I | re.M)
+            if subj_hint:
+                subject = subj_hint.group(1).strip()
+        if not date_field:
+            date_hint = re.search(
+                r"(?:^|\n)\s*((?:Mon|Tue|Wed|Thu|Fri|Sat|Sun)[a-z]*,?\s+\w+\s+\d{1,2},?\s+\d{4}[^\n]*)",
+                header_window,
+                re.I | re.M,
+            )
+            if date_hint:
+                date_field = date_hint.group(1).strip()
 
         return {
             "from_name": from_name,
@@ -548,6 +611,10 @@ class RedactionForensics:
     def __init__(self, db: DatabaseManager, config: dict):
         self.db = db
         self.cfg = config.get("processor", {}).get("redaction_forensics", {})
+        ocr_cfg = config.get("processor", {}).get("ocr", {})
+        base_dpi = int(ocr_cfg.get("dpi", 300))
+        configured = int(self.cfg.get("rasterize_dpi", max(base_dpi, 300)))
+        self.rasterize_dpi = max(300, min(configured, 900))
 
     # ------------------------------------------------------------------
     def detect_redactions(
@@ -1263,7 +1330,7 @@ class RedactionForensics:
             clip.x1 = min(page.rect.width, clip.x1 + 2)
             clip.y1 = min(page.rect.height, clip.y1 + 2)
 
-            pix = page.get_pixmap(dpi=300, clip=clip)
+            pix = page.get_pixmap(dpi=self.rasterize_dpi, clip=clip)
             img = Image.frombytes("RGB", (pix.width, pix.height), pix.samples)
 
             # Apply brightness/contrast enhancement to reveal faint text
@@ -1867,6 +1934,7 @@ class ImageForensics:
                         "y": y,
                         "width": run_len,
                         "height": min_height_run,
+                        "type": "dark" if (pixels[run_start, y][0] + pixels[run_start, y][1] + pixels[run_start, y][2]) < 30 else "white"
                     })
         except Exception as exc:
             log.debug("Redaction box detection error: %s", exc)
@@ -2162,7 +2230,7 @@ class EmailChainStitcher:
                             if (first - timedelta(days=365)) <= fp_time <= (last + timedelta(days=365)):
                                 match_score += 1
                         except Exception:
-                            logger.debug("Time-range match failed", exc_info=True)
+                            log.debug("Time-range match failed", exc_info=True)
 
                 if match_score >= 2:
                     return {"chain_id": chain["id"], "match_type": "fuzzy", "score": match_score}
@@ -2287,7 +2355,7 @@ class EmailChainStitcher:
                 if chain_row and chain_row["participants"]:
                     all_participants = set(json.loads(chain_row["participants"]))
             except Exception:
-                logger.debug("Failed to load chain participants", exc_info=True)
+                log.debug("Failed to load chain participants", exc_info=True)
             if email_data.get("from_address"):
                 all_participants.add(email_data["from_address"].lower())
             for a in email_data.get("to", []):
@@ -2349,6 +2417,11 @@ class EmailChainStitcher:
                 try:
                     t1 = datetime.fromisoformat(msgs[i]["email_date"])
                     t2 = datetime.fromisoformat(msgs[i + 1]["email_date"])
+                    # Normalize both to naive UTC to avoid TypeError on mixed aware/naive
+                    if t1.tzinfo is not None:
+                        t1 = t1.replace(tzinfo=None)
+                    if t2.tzinfo is not None:
+                        t2 = t2.replace(tzinfo=None)
                     delta = t2 - t1
 
                     # Flag gaps > 7 days as suspicious for active chains
@@ -2486,12 +2559,17 @@ class EntityExtractor:
         """Find all entities in text using spaCy NER + custom regex patterns."""
         if not text:
             return []
+        text = text.strip()
+        if len(text) < 20:
+            return []
 
         entities: List[Dict[str, Any]] = []
         seen_canonical: Dict[str, int] = {}  # canonical_name -> entity_id from this run
 
         # --- spaCy NER ---
-        if self.nlp:
+        alpha_ratio = sum(1 for c in text if c.isalpha()) / max(len(text), 1)
+        should_run_spacy = bool(self.nlp) and len(text) >= 180 and alpha_ratio >= 0.35
+        if should_run_spacy:
             try:
                 # Process in chunks if text is very long
                 max_len = 100000
@@ -2511,6 +2589,8 @@ class EntityExtractor:
 
                             name = ent.text.strip()
                             if len(name) < 2 or len(name) > 200:
+                                continue
+                            if self._is_noise_entity(name, entity_type):
                                 continue
 
                             canonical = self._canonicalize(name)
@@ -2555,12 +2635,14 @@ class EntityExtractor:
         # Dollar amounts
         for m in DOLLAR_AMOUNT_PATTERN.finditer(text):
             amount = m.group(0)
-            entities.append({
-                "name": amount,
-                "entity_type": "financial",
-                "canonical_name": amount,
-                "context": text[max(0, m.start() - 80):m.end() + 80],
-            })
+            if amount not in seen_canonical:
+                entities.append({
+                    "name": amount,
+                    "entity_type": "financial",
+                    "canonical_name": amount,
+                    "context": text[max(0, m.start() - 80):m.end() + 80],
+                })
+                seen_canonical[amount] = len(entities) - 1
 
         # Account numbers
         for m in ACCOUNT_NUMBER_PATTERN.finditer(text):
@@ -2603,6 +2685,8 @@ class EntityExtractor:
         # Addresses
         for m in ADDRESS_PATTERN.finditer(text):
             addr = m.group(0).strip()
+            if self._is_noise_entity(addr, "location"):
+                continue
             canonical = re.sub(r"\s+", " ", addr).upper()
             if canonical not in seen_canonical:
                 entities.append({
@@ -2694,6 +2778,40 @@ class EntityExtractor:
         # Uppercase for consistency with knowledge_graph.normalize_name()
         name = name.upper()
         return name
+
+    @staticmethod
+    def _is_noise_entity(name: str, entity_type: str) -> bool:
+        if not name:
+            return True
+        s = name.strip()
+        if len(s) < 2 or len(s) > 200:
+            return True
+        if "\n" in s or "\r" in s:
+            return True
+        if entity_type in {"person", "organization", "location"}:
+            # Reject OCR shrapnel and low-information strings for semantic entities.
+            if re.match(r"^[A-Z]{1,3}\d{3,}$", s):
+                return True
+            if re.match(r"^EFTA\d+$", s, re.I):
+                return True
+            if re.search(r"(.)\1{4,}", s):
+                return True
+            clean = re.sub(r"[^A-Za-z\s'.-]", "", s)
+            words = [w for w in clean.split() if w]
+            if not words:
+                return True
+            if len(words) == 1 and len(words[0]) > 18:
+                return True
+            if len(words) >= 2:
+                bad = 0
+                for w in words:
+                    if len(w) >= 5:
+                        vowels = sum(1 for c in w.lower() if c in "aeiouy")
+                        if vowels / max(len(w), 1) < 0.2:
+                            bad += 1
+                if bad >= max(2, len(words) // 2):
+                    return True
+        return False
 
     @staticmethod
     def _google_search_url(name: str) -> str:
@@ -2803,6 +2921,28 @@ class PriorityScorer:
                     "CODEWORD detected in doc_id=%d '%s': %s",
                     document_id, doc["original_filename"],
                     ", ".join(codewords_found[:10]),
+                )
+
+            # --- Detective-style investigative indicators ---
+            # These are concrete signals investigators triage first:
+            # minors/recruitment, travel logistics, concealment, coercion, and cash/wire flows.
+            signal_hits: dict[str, int] = {}
+            for key, pat in INVESTIGATIVE_SIGNAL_PATTERNS:
+                if pat.search(full_text):
+                    signal_hits[key] = signal_hits.get(key, 0) + 1
+            if signal_hits:
+                per_signal = int(self.cfg.get("detective_signal_weight", 7))
+                max_bonus = int(self.cfg.get("detective_signal_cap", 28))
+                score += min(len(signal_hits) * per_signal, max_bonus)
+                if {"minor_risk", "recruitment"} <= set(signal_hits.keys()):
+                    score += int(self.cfg.get("minor_recruitment_combo_bonus", 12))
+                if {"travel_coordination", "cash_or_wire"} <= set(signal_hits.keys()):
+                    score += int(self.cfg.get("travel_financial_combo_bonus", 10))
+                log.info(
+                    "Investigative signals detected in doc_id=%d '%s': %s",
+                    document_id,
+                    doc["original_filename"],
+                    ", ".join(sorted(signal_hits.keys())),
                 )
 
             # Cap at 100
@@ -3019,7 +3159,7 @@ class ProcessorEngine:
             else:
                 conn.execute(
                     """UPDATE documents
-                       SET analysis_completed = 1, status = 'analyzed', updated_at = ?
+                       SET analysis_completed = 0, status = 'ocr_complete', updated_at = ?
                        WHERE id = ?""",
                     (datetime.now(tz=timezone.utc).isoformat(), document_id),
                 )

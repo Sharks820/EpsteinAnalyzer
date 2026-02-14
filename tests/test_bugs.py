@@ -387,6 +387,85 @@ class TestDuplicateAnalysisPrevention:
         assert count == 2
 
 
+class TestModelRunnerConfiguration:
+    """Gemini/Kimi runner settings from config must be honored."""
+
+    def test_gemini_runner_uses_configured_cli_and_retries(self):
+        from ai_pipeline.pipeline import GracefulDegradation
+
+        cfg = {
+            "ai_pipeline": {
+                "models": {
+                    "codex": {"enabled": False},
+                    "claude": {"enabled": False},
+                    "kimi": {"enabled": False},
+                    "gemini": {
+                        "enabled": True,
+                        "cli_command": "gemini-proxy",
+                        "timeout_seconds": 123,
+                        "max_retries": 2,
+                        "retry_backoff_seconds": 1.5,
+                        "extra_args": ["--json"],
+                    },
+                }
+            }
+        }
+        gd = GracefulDegradation(cfg)
+        assert len(gd._runners) == 1
+        r = gd._runners[0]
+        assert r.get_name() == "gemini"
+        assert r.cli_command == "gemini-proxy"
+        assert r.timeout == 123
+        assert r.max_retries == 2
+        assert r.retry_backoff_seconds == 1.5
+        assert r.extra_args == ["--json"]
+
+    def test_availability_is_cached_for_speed(self):
+        from ai_pipeline.pipeline import GracefulDegradation, ModelRunner
+
+        class FakeRunner(ModelRunner):
+            calls = 0
+
+            def __init__(
+                self,
+                cli_command: str = "fake",
+                timeout: int = 300,
+                extra_args=None,
+                max_retries: int = 0,
+                retry_backoff_seconds: float = 2.0,
+            ):
+                super().__init__(
+                    cli_command,
+                    timeout,
+                    extra_args=extra_args,
+                    max_retries=max_retries,
+                    retry_backoff_seconds=retry_backoff_seconds,
+                )
+
+            def get_name(self) -> str:
+                return "fake"
+
+            def check_available(self) -> bool:
+                FakeRunner.calls += 1
+                return True
+
+            def _build_command(self, prompt_file: str) -> list[str]:
+                return [self.cli_command]
+
+        cfg = {
+            "ai_pipeline": {
+                "models_availability_cache_seconds": 9999,
+                "models": {"fake": {"enabled": True, "cli_command": "fake"}},
+            }
+        }
+        with patch.object(GracefulDegradation, "_RUNNER_CLASSES", [FakeRunner]):
+            gd = GracefulDegradation(cfg)
+            FakeRunner.calls = 0
+            _ = gd.get_available_runners()
+            _ = gd.get_available_runners()
+            assert FakeRunner.calls == 1
+
+
 class TestPlaceholderTextSkip:
     """Finding 17 (P3): AI analysis should skip documents with no extracted text."""
 
@@ -409,6 +488,54 @@ class TestPlaceholderTextSkip:
         # Call the internal helper to verify placeholder detection
         text = engine._get_document_text(1)
         assert text.startswith("(No extracted text")
+
+
+# ============================================================================
+#  3b. STUCK JOB RECOVERY — reset stale "analyzing" docs automatically
+# ============================================================================
+
+
+class TestStuckAnalyzingRecovery:
+    """Stale 'analyzing' rows should be returned to queue automatically."""
+
+    def test_recover_stale_analyzing_documents(self, db_manager, db_conn):
+        from datetime import datetime, timedelta, timezone
+        from ai_pipeline.pipeline import PipelineEngine
+
+        db_conn.execute("INSERT INTO datasets (dataset_number, source) VALUES (1, 'test')")
+        now = datetime.now(timezone.utc)
+        stale_ts = (now - timedelta(minutes=30)).isoformat()
+        fresh_ts = (now - timedelta(minutes=2)).isoformat()
+
+        # stale -> should be reset
+        db_conn.execute(
+            "INSERT INTO documents (dataset_id, file_hash, original_filename, file_path, source, "
+            "status, analysis_completed, updated_at) VALUES (1, 'stale_h', 'stale.pdf', '/t', 'doj', "
+            "'analyzing', 0, ?)",
+            (stale_ts,),
+        )
+        # fresh -> should remain analyzing
+        db_conn.execute(
+            "INSERT INTO documents (dataset_id, file_hash, original_filename, file_path, source, "
+            "status, analysis_completed, updated_at) VALUES (1, 'fresh_h', 'fresh.pdf', '/t', 'doj', "
+            "'analyzing', 0, ?)",
+            (fresh_ts,),
+        )
+        db_conn.commit()
+
+        engine = PipelineEngine.__new__(PipelineEngine)
+        engine.db = db_manager
+        engine.config = {"ai_pipeline": {"batch": {"stuck_reset_minutes": 15}}}
+
+        recovered = engine._recover_stuck_documents(dataset_number=1)
+        assert recovered == 1
+
+        rows = db_conn.execute(
+            "SELECT original_filename, status FROM documents ORDER BY original_filename"
+        ).fetchall()
+        statuses = {r["original_filename"]: r["status"] for r in rows}
+        assert statuses["fresh.pdf"] == "analyzing"
+        assert statuses["stale.pdf"] == "ocr_complete"
 
 
 # ============================================================================
@@ -946,3 +1073,76 @@ class TestWALMode:
         # Negative value = KB, so -64000 = 64MB
         val = db_conn.execute("PRAGMA cache_size").fetchone()[0]
         assert val == -64000
+
+
+# ============================================================================
+#  17. PARSING + EMAIL CHAIN ROBUSTNESS
+# ============================================================================
+
+
+class TestResponseParserRoleAndScoreFields:
+    """Ensure richer AI role/score fields are parsed without data loss."""
+
+    def test_evidence_scores_preserve_category_and_justification(self):
+        from ai_pipeline.pipeline import ResponseParser
+
+        parser = ResponseParser()
+        parsed = parser.parse_response(
+            """
+=== SUMMARY ===
+ok
+=== EVIDENCE_SCORE ===
+- Jane Doe | 92 | facilitator | Multiple records tie subject to planning activity
+""",
+            model_name="codex",
+        )
+        assert parsed["evidence_scores"] is not None
+        first = parsed["evidence_scores"][0]
+        assert first["name"] == "Jane Doe"
+        assert first["score"] == 92
+        assert first["category"] == "facilitator"
+        assert "planning activity" in first["justification"]
+
+    def test_career_roles_include_employment_and_crime_link(self):
+        from ai_pipeline.pipeline import ResponseParser
+
+        parser = ResponseParser()
+        parsed = parser.parse_response(
+            """
+=== SUMMARY ===
+ok
+=== CAREER_ROLES ===
+- John Smith | Driver | Palm Transport LLC | 2004-2006 | employee_of_vendor_or_contractor | logistics_or_transport_support | "Drove passengers to residence."
+""",
+            model_name="gemini",
+        )
+        assert parsed["career_roles"] is not None
+        role = parsed["career_roles"][0]
+        assert role["name"] == "John Smith"
+        assert role["organization"] == "Palm Transport LLC"
+        assert role["employment_link"] == "employee_of_vendor_or_contractor"
+        assert role["crime_link"] == "logistics_or_transport_support"
+        assert "Drove passengers" in role["evidence_quote"]
+
+
+class TestDocumentClassifierEmailFallback:
+    """Email classification should still work when OCR headers are partial."""
+
+    @pytest.mark.skipif(
+        not all(__import__("importlib").util.find_spec(m) for m in ["fitz", "pytesseract", "PIL"]),
+        reason="Requires processor dependencies",
+    )
+    def test_email_detected_from_addresses_and_reply_markers(self):
+        from processor.processor import DocumentClassifier
+
+        classifier = DocumentClassifier()
+        sample = """
+Forwarded message
+On Tue, Jan 5, 2016 at 9:15 AM someone wrote:
+john.doe@example.com
+jane.smith@example.org
+Subject - Re: Travel update
+"""
+        result = classifier.classify(sample, {"filename": "scan_123.pdf"})
+        assert result["doc_type"] == "email"
+        assert result.get("email_data") is not None

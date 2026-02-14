@@ -8,14 +8,14 @@ gunicorn==23.0.0
 PyMuPDF==1.25.3
 pytesseract==0.3.13
 pdf2image==1.17.0
-Pillow==11.1.0
+Pillow>=11.1.0
 
 # Database (SQLite via stdlib; no ORM needed)
 
 # Web Scraping / Harvesting
 requests==2.32.3
 beautifulsoup4==4.12.3
-lxml==5.3.0
+lxml>=5.3.0
 
 # NLP & Entity Extraction
 spacy==3.8.4
@@ -34,11 +34,11 @@ cryptography==44.0.0
 pynacl==1.5.0
 
 # Utilities
-python-dateutil==2.9.0
+python-dateutil>=2.9.0
 tqdm==4.67.1
-pyyaml==6.0.2
+pyyaml>=6.0.2
 colorama==0.4.6
 
 # Export
 markdown==3.7.0
-jinja2==3.1.5
+jinja2>=3.1.5

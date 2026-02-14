@@ -1,0 +1,37 @@
+I have an AI analysis pipeline that processes documents through 4 CLI-based AI models (codex, gemini, claude, kimi). Each model is invoked via subprocess as a CLI tool. The pipeline analyzes legal/government documents, extracting entities, relationships, redactions, evidence scores, etc.
+
+CURRENT PERFORMANCE PROBLEM:
+- 51 documents in dataset 1, 12 datasets total (hundreds of docs)
+- Each document takes 2-3 minutes even with all 4 models running in PARALLEL via ThreadPoolExecutor
+- The bottleneck is each CLI model invocation takes 30-175 seconds per document
+- Total time for 51 docs ~2-3 hours. With 12 datasets this could be 24+ hours
+
+CURRENT ARCHITECTURE:
+1. For each document: load text from SQLite, build prompt (~2KB template + full document text + known entities list), write prompt to temp file, pipe to each CLI
+2. Models run in parallel via ThreadPoolExecutor (4 workers)
+3. Documents processed sequentially (one at a time) because chain_aware mode groups email chains
+4. Each model returns structured text response, parsed into entities/relationships/redactions
+5. Consensus engine merges 4 model outputs
+6. Results saved to SQLite (entities, relationships, ai_analyses tables)
+
+CURRENT MODEL INVOCATION (each is a subprocess call):
+- codex: `codex exec -C <project_root> -` with stdin from temp file (37-175s per doc)
+- gemini: `gemini -p -` with stdin pipe (46-55s per doc)
+- claude: `claude --print -p <temp_file>` (49-89s per doc)
+- kimi: `kimi -p -` with stdin pipe (42-83s per doc)
+
+WHAT I NEED:
+Suggest concrete, implementable optimizations to dramatically reduce total processing time. Consider:
+
+1. Can multiple DOCUMENTS be processed in parallel too (not just models)? What are the risks with SQLite concurrent writes?
+2. Are there ways to reduce the prompt size / token count to speed up model responses?
+3. Could we batch multiple short documents into a single prompt?
+4. Could we use a tiered approach - run only 2 fast models first, only escalate to 4 if disagreement?
+5. Could we cache/skip documents similar to already-analyzed ones?
+6. Any way to speed up the CLI subprocess overhead itself?
+7. Could we truncate document text intelligently (e.g. first N pages only for very long docs)?
+8. Could we parallelize at the dataset level too?
+9. Should we reduce from 4 models to 2 for the consensus (min_models_for_consensus is already 2)?
+10. Any other creative approaches?
+
+Give me specific, actionable code-level recommendations ranked by impact. Focus on what will give the biggest speedup with the least complexity.
